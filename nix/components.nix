@@ -40,6 +40,36 @@ let
     hash = "sha256-CpyONDUtrUYAaqgoNtU4O/+dxryc5aYFU8Baow5q0fk=";
   };
 
+  zlibSource = fetchurl {
+    name = "zlib-1.3.1-source.tar.gz";
+    url = "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz";
+    sha256 = "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23";
+  };
+
+  libjpegSource = fetchurl {
+    name = "libjpeg-10-source.tar.gz";
+    url = "https://www.ijg.org/files/jpegsrc.v10.tar.gz";
+    sha256 = "8b9eaa13242690ebd03e1728ab1edf97a81a78ed6e83624d493655f31ac95ab5";
+  };
+
+  libtiffSource = fetchurl {
+    name = "libtiff-4.7.1-source.tar.gz";
+    url = "https://download.osgeo.org/libtiff/tiff-4.7.1.tar.gz";
+    sha256 = "f698d94f3103da8ca7438d84e0344e453fe0ba3b7486e04c5bf7a9a3fabe9b69";
+  };
+
+  libxml2Source = fetchurl {
+    name = "libxml2-2.12.8-source.tar.xz";
+    url = "https://download.gnome.org/sources/libxml2/2.12/libxml2-2.12.8.tar.xz";
+    sha256 = "43ad877b018bc63deb2468d71f95219c2fac196876ef36d1bee51d226173ec93";
+  };
+
+  libxsltSource = fetchurl {
+    name = "libxslt-1.1.42-source.tar.xz";
+    url = "https://download.gnome.org/sources/libxslt/1.1/libxslt-1.1.42.tar.xz";
+    sha256 = "85ca62cac0d41fc77d3f6033da9df6fd73d20ea2fc18b0a3609ffb4110e1baeb";
+  };
+
   vkd3dArchive = fetchurl {
     name = "vkd3d-proton-3.0.1.tar.zst";
     url = "https://github.com/HansKristian-Work/vkd3d-proton/releases/download/v3.0.1/vkd3d-proton-3.0.1.tar.zst";
@@ -183,6 +213,11 @@ let
       buildPhase = ''
         runHook preBuild
         mkdir -p $out
+        cp ${zlibSource} $out/zlib-1.3.1-source.tar.gz
+        cp ${libjpegSource} $out/libjpeg-10-source.tar.gz
+        cp ${libtiffSource} $out/libtiff-4.7.1-source.tar.gz
+        cp ${libxml2Source} $out/libxml2-2.12.8-source.tar.xz
+        cp ${libxsltSource} $out/libxslt-1.1.42-source.tar.xz
         cp -a ${src}/scripts $TMPDIR/raven-scripts
         chmod -R u+w $TMPDIR/raven-scripts
 
@@ -219,17 +254,13 @@ CLSID_EOF
 
         substituteInPlace $TMPDIR/raven-scripts/provision-installer.py \
           --replace-fail 'repo = Path(__file__).resolve().parents[1]' 'repo = Path(os.environ["RAVEN_REPO_ROOT"])' \
-          --replace-fail 'headers = Path("/usr") / triple / "include"' 'headers = Path(os.environ["MINGW_HEADERS"])' \
-          --replace-fail 'Path("/usr/share/mingw-w64/include/propkey.h")' 'Path(os.environ["MINGW_INCLUDE"]) / "propkey.h"' \
           --replace-fail '-Werror=int-conversion",' '-Werror=int-conversion", "-Wno-error=incompatible-pointer-types",' \
-          --replace-fail 'msxml_flags = ["-O2",' 'msxml_flags = ["-include", os.environ["MSXML3_COMPAT_HEADER"], "-O2",' \
-          --replace-fail 'run([*widl, "-t", "-T", generated / "tom_library.tlb", own_riched / "tom_library.idl"])' 'run([*widl, "-L", generated, "-t", "-T", generated / "tom_library.tlb", own_riched / "tom_library.idl"])' \
+          --replace-fail 'msxml_flags = ["-O2",' 'msxml_flags = ["-include", os.environ["MSXML3_COMPAT_HEADER"], "-O2",'
 
 
         export RAVEN_REPO_ROOT=${src}
         export PATH="${pkgs.wine64Packages.minimal}/bin:$PATH"
         python3 $TMPDIR/raven-scripts/provision-installer.py \
-          --archive ${reactos} \
           --output $out \
           --arch ${arch}
         runHook postBuild
