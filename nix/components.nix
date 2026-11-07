@@ -266,6 +266,147 @@ CLSID_EOF
         runHook postBuild
       '';
     };
+
+  skiaSource = pkgs.fetchgit {
+    url = "https://skia.googlesource.com/skia.git";
+    rev = "a21aae83d6e4e3da284100a30f0a5eafc443b60f";
+    hash = "sha256-ofmQJl6050CmoPpP97QSPVodzh348BdOniBXUF8f1+8=";
+  };
+
+  skiaDeps = pkgs.stdenv.mkDerivation {
+    pname = "raven-skia-deps";
+    version = "a21aae";
+
+    src = skiaSource;
+
+    nativeBuildInputs = [
+      pkgs.git
+      pkgs.python3
+      pkgs.cacert
+    ];
+
+    outputHashMode = "recursive";
+    outputHashAlgo = "sha256";
+    outputHash = "sha256-ZBOGqU6BC9gRRGeBxthq/oF7MCnwzV+VruIE7R5nr2A=";
+
+    buildPhase = ''
+      export HOME=$TMPDIR
+      export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+      export GIT_SYNC_DEPS_SKIP_EMSDK=1
+      git config --global url."https://".insteadOf git://
+      sed -i '/thread.start()/a\    thread.join()' tools/git-sync-deps
+      python3 tools/git-sync-deps
+    '';
+
+    installPhase = ''
+      mkdir -p $out
+      cp -a . $out/
+      find $out -type d -name .git -prune -exec rm -rf {} +
+      rm -rf $out/bin $out/tools $out/infra $out/site $out/docs $out/resources
+      rm -rf $out/tests $out/testdata $out/bench $out/gm $out/fuzz $out/example
+      rm -rf $out/third_party/externals
+      find $out -type l -lname '*nix/store*' -delete
+      find $out -type f -print0 | xargs -0 -r grep -lZ '/nix/store' | xargs -0 -r rm -f || true
+      for hash in "$(basename ${pkgs.bash} | cut -c1-32)" nnm9gdr70ihc6zc9298mzz8jpcgaciql; do
+        find $out -type f -print0 | xargs -0 -r grep -lZ "$hash" | xargs -0 -r rm -f || true
+        find $out -type l -lname "*$hash*" -delete
+      done
+    '';
+  };
+
+  skia = pkgs.stdenv.mkDerivation {
+    pname = "raven-skia";
+    version = "a21aae";
+
+    src = skiaDeps;
+
+    nativeBuildInputs = [
+      pkgs.gn
+      pkgs.ninja
+      pkgs.python3
+      pkgs.pkg-config
+      pkgs.clang
+      pkgs.lld
+    ];
+
+    buildInputs = [ pkgs.freetype ];
+
+    buildPhase = ''
+      mkdir -p out
+      cat > out/args.gn <<'EOF'
+      is_official_build = true
+      is_debug = false
+      cc = "clang"
+      cxx = "clang++"
+      skia_enable_ganesh = false
+      skia_enable_graphite = false
+      skia_enable_pdf = false
+      skia_enable_skottie = false
+      skia_enable_svg = false
+      skia_enable_tools = false
+      skia_use_partition_alloc = false
+      skia_use_gl = false
+      skia_use_x11 = false
+      skia_use_fontconfig = false
+      skia_use_freetype = true
+      skia_use_harfbuzz = false
+      skia_use_icu = false
+      skia_use_expat = false
+      skia_use_piex = false
+      skia_use_wuffs = false
+      skia_use_libjpeg_turbo_decode = false
+      skia_use_libjpeg_turbo_encode = false
+      skia_use_libpng_decode = false
+      skia_use_libpng_encode = false
+      skia_use_libwebp_decode = false
+      skia_use_libwebp_encode = false
+      skia_use_zlib = false
+      skia_use_perfetto = false
+      skia_enable_fontmgr_empty = true
+      skia_enable_fontmgr_custom_empty = true
+      skia_use_system_freetype2 = true
+      EOF
+
+      gn gen out
+      ninja -C out skia
+    '';
+
+    installPhase = ''
+      mkdir -p $out/lib
+      ln -s ${skiaDeps} $out/source
+      cp out/libskia.a $out/lib/libskia.a
+    '';
+  };
+
+  liberationDeb = fetchurl {
+    name = "fonts-liberation.deb";
+    url = "http://archive.ubuntu.com/ubuntu/pool/main/f/fonts-liberation/fonts-liberation_2.1.5-3build1_all.deb";
+    sha256 = "47f156bc945cfc69cf2f2a0c19b8c82b67a685738d3846673462de6a73266e1b";
+  };
+
+  dejavuArchive = fetchurl {
+    name = "dejavu-fonts-ttf-2.37.tar.bz2";
+    url = "https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-2.37.tar.bz2";
+    sha256 = "fa9ca4d13871dd122f61258a80d01751d603b4d3ee14095d65453b4e846e17d7";
+  };
+
+  fontOutput = pkgs.runCommand "raven-fonts" {
+    nativeBuildInputs = [
+      (pkgs.python3.withPackages (ps: [ ps.fonttools ]))
+      pkgs.gnutar
+      pkgs.xz
+      pkgs.zstd
+      pkgs.git
+      pkgs.clang
+    ];
+  } ''
+    mkdir -p $out
+    cp ${liberationDeb} $out/fonts-liberation.deb
+    cp ${dejavuArchive} $out/dejavu-fonts-ttf-2.37.tar.bz2
+    python3 ${src}/scripts/provision-text.py --output $out --fonts-only
+    test -f $out/fonts/LiberationSans-Regular.ttf
+    test -f $out/fonts/RavenSans-Regular.ttf
+  '';
 in
 {
   inherit
@@ -297,7 +438,7 @@ in
   '';
 
   libpng = pkgs.libpng;
-  fonts = "${pkgs.liberation_ttf_v2}/share/fonts/truetype";
+  fonts = "${fontOutput}/fonts";
 
-  skia = null;
+  inherit fontOutput skia skiaDeps;
 }

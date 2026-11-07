@@ -109,6 +109,7 @@ let
       pkgs.python3
       pkgs.pkg-config
       pkgs.wayland
+      pkgs.wayland-scanner
       pkgs.libffi
       pkgs.wayland-protocols
       pkgs.clang
@@ -129,6 +130,7 @@ let
       pkgs.libXext
       pkgs.libGL
       pkgs.libGLU
+      pkgs.mesa
       pkgs.vulkan-loader
       pkgs.vulkan-headers
       pkgs.freetype
@@ -140,14 +142,21 @@ let
     preConfigure = ''
       mkdir -p build/testdata/downloads
       cp -a ${components.fixtures}/downloads/. build/testdata/downloads/
-      sed -i 's/-mno-stack-arg-probe/-mno-stack-arg-probe -fomit-frame-pointer -momit-leaf-frame-pointer -O0/g' native/CMakeLists.txt
+      sed -i 's/-mno-stack-arg-probe/-mno-stack-arg-probe -fno-stack-clash-protection -fomit-frame-pointer -momit-leaf-frame-pointer -O0/g' native/CMakeLists.txt
       sed -i '/add_custom_target(vulkan_.*_fixture ALL DEPENDS/ s/ ALL DEPENDS.*/)/' native/CMakeLists.txt
       sed -i '/add_custom_target(cxx_exception_fixtures ALL DEPENDS/ s/ ALL DEPENDS.*/)/' native/CMakeLists.txt
       sed -i '/add_custom_target(gcc_exceptions_fixture ALL DEPENDS/ s/ ALL DEPENDS.*/)/' native/CMakeLists.txt
     '';
 
+    postConfigure = ''
+      grep -q -- '-DRAVEN_WAYLAND' compile_commands.json build/compile_commands.json 2>/dev/null
+    '' + lib.optionalString withSkia ''
+      grep -q -- '-DRAVEN_SKIA' compile_commands.json build/compile_commands.json 2>/dev/null
+    '';
+
     cmakeFlags = [
       "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
+      "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
       "-DRAVEN_VK_XML=${pkgs.vulkan-headers}/share/vulkan/registry/vk.xml"
       "-DRAVEN_VULKAN_CORE_HEADER=${pkgs.vulkan-headers}/include/vulkan/vulkan_core.h"
     ]
@@ -229,9 +238,10 @@ let
 
       ${lib.optionalString withFonts ''
         mkdir -p $out/libexec/raven/fonts
-        for font in ${components.fonts}/Liberation*.ttf; do
+        for font in ${components.fonts}/*.ttf; do
           install -Dm644 "$font" $out/libexec/raven/fonts/$(basename "$font")
         done
+        ln -s ${components.fonts} $out/libexec/raven/fonts-source
       ''}
 
       install -Dm644 ${src}/LICENSE $out/libexec/raven/LICENSE
