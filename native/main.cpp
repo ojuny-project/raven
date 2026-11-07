@@ -46,7 +46,7 @@ static std::vector<uint8_t> read_file(const char *path)
 {
 	std::ifstream file(path, std::ios::binary | std::ios::ate);
 	if (!file)
-		throw std::runtime_error("cannot open PE file");
+		throw std::runtime_error(std::string("cannot open PE file: ")+path);
 	const auto size = file.tellg();
 	if (size < 0 || size > 1024 * 1024 * 1024)
 		throw std::runtime_error("PE file exceeds inspection size limit");
@@ -184,34 +184,28 @@ int main(int argc, char **argv)
 	auto timeout=std::chrono::milliseconds(5000);
 	bool timeout_given=false;
 	bool wayland=false,x11=false;
-	if (run_process && argc>3 && std::string_view(argv[3]).starts_with("--timeout-ms=")) {
-		const std::string_view value=std::string_view(argv[3]).substr(13);
-		uint64_t milliseconds=0;
-		const auto parsed=std::from_chars(value.data(),value.data()+value.size(),milliseconds);
-		if (parsed.ec!=std::errc{} || parsed.ptr!=value.data()+value.size() || milliseconds<1 || milliseconds>86400000) {
-			std::cerr << "raven: native timeout must be 1..86400000 milliseconds\n";
-			return 2;
-		}
-		timeout=std::chrono::milliseconds(milliseconds);
-		timeout_given=true;
-		first_file=4;
-	}
-	if (run_process && argc>first_file && std::string_view(argv[first_file])=="--desktop=wayland") {
-		wayland=true; ++first_file;
-	} else if (run_process && argc>first_file && std::string_view(argv[first_file])=="--desktop=x11") {
-		x11=true; ++first_file;
-	}
 	bool inherited_stdio=false;
-	if (run_process && argc>first_file && std::string_view(argv[first_file])=="--stdio=inherit") {
-		inherited_stdio=true; ++first_file;
-	}
 	// A program started by another one carries the command line and the directory its parent chose.
 	std::optional<std::string> command_line_text, directory_text;
 	int environment_fd=-1,suspended_fd=-1,inherit_fd=-1,handle_channel_fd=-1,guest_error_fd=2;
 	bool elevated=false,noninteractive=false;
 	for (bool more=run_process;more && argc>first_file;) {
 		const std::string_view option=argv[first_file];
-		if (option.starts_with("--command-line=")) command_line_text=std::string(option.substr(15));
+		if (option.starts_with("--timeout-ms=")) {
+			const std::string_view value=option.substr(13);
+			uint64_t milliseconds=0;
+			const auto parsed=std::from_chars(value.data(),value.data()+value.size(),milliseconds);
+			if (parsed.ec!=std::errc{} || parsed.ptr!=value.data()+value.size() || milliseconds<1 || milliseconds>86400000) {
+				std::cerr << "raven: native timeout must be 1..86400000 milliseconds\n";
+				return 2;
+			}
+			timeout=std::chrono::milliseconds(milliseconds);
+			timeout_given=true;
+		}
+		else if (option=="--desktop=wayland") { wayland=true; x11=false; }
+		else if (option=="--desktop=x11") { x11=true; wayland=false; }
+		else if (option=="--stdio=inherit") inherited_stdio=true;
+		else if (option.starts_with("--command-line=")) command_line_text=std::string(option.substr(15));
 		else if (option.starts_with("--directory=")) directory_text=std::string(option.substr(12));
 		else if (option.starts_with("--environment-fd=")) environment_fd=std::atoi(std::string(option.substr(17)).c_str());
 		else if (option.starts_with("--suspended-fd=")) {
@@ -223,10 +217,13 @@ int main(int argc, char **argv)
 		else if (option.starts_with("--diagnostics-fd=")) {
 			// The runtime's own messages go where the parent runtime writes its own; the program's standard error moves out of their way
 			// to a descriptor of its own, so nothing the runtime says ever lands in a pipe the program reads.
+			// RAVEN_TRACE_FILE already gave this process a file of its own, which the parent's descriptor would replace.
 			const int diagnostics=std::atoi(std::string(option.substr(17)).c_str());
-			const int moved=::fcntl(2,F_DUPFD_CLOEXEC,64);
-			if (moved>=0 && ::dup2(diagnostics,2)==2) guest_error_fd=moved;
-			else if (moved>=0) ::close(moved);
+			if (!std::getenv("RAVEN_TRACE_FILE")) {
+				const int moved=::fcntl(2,F_DUPFD_CLOEXEC,64);
+				if (moved>=0 && ::dup2(diagnostics,2)==2) guest_error_fd=moved;
+				else if (moved>=0) ::close(moved);
+			}
 			::close(diagnostics);
 		}
 #ifdef RAVEN_NATIVE_CPU
@@ -315,7 +312,8 @@ int main(int argc, char **argv)
 						for (const auto &[from, folder] : {std::pair{runtime, "system32"}, std::pair{runtime / "x86", "syswow64"}})
 							for (const char *program : {"cmd.exe", "msiexec.exe", "regsvr32.exe", "control.exe", "dism.exe", "fondue.exe", "regedit.exe", "mscoree.dll", "riched20.dll",
 									"msftedit.dll", "l_intl.nls", "find.exe", "findstr.exe", "more.com", "sort.exe", "where.exe", "xcopy.exe", "attrib.exe",
-									"timeout.exe", "choice.exe", "whoami.exe", "hostname.exe", "tasklist.exe", "taskkill.exe", "reg.exe", "rundll32.exe"}) {
+									"timeout.exe", "choice.exe", "whoami.exe", "hostname.exe", "tasklist.exe", "taskkill.exe", "reg.exe", "rundll32.exe", "cscript.exe",
+									"wscript.exe"}) {
 								std::error_code error;
 								// The 64-bit Registry Editor lives in the Windows folder itself.
 								const bool windows_folder = std::string_view(program) == "regedit.exe" && std::string_view(folder) == "system32";
@@ -457,6 +455,10 @@ int main(int argc, char **argv)
 							if (std::filesystem::exists(component))
 								return read_module(component.c_str());
 						}
+						// The common controls component stands in for comctl32.dll however late the program loads it.
+						if (!selected && name=="comctl32.dll")
+							if (const auto component = component_directory / "comctl32.dll"; std::filesystem::exists(component))
+								return read_module(component.c_str());
 						if (!selected && name=="ucrtbase.dll") {
 							// A 32-bit program gets the 32-bit build of the component.
 							const auto component = std::filesystem::read_symlink("/proc/self/exe").parent_path() / (entry->image.is_64 ? "ucrtbase.dll" : "ucrtbase32.dll");
@@ -540,16 +542,45 @@ int main(int argc, char **argv)
 							for (const auto &descriptor : item.second->image.delay_imports())
 								visit(descriptor.imports);
 						}
+						// A small launcher that loads its own libraries by name later, as an updater loads the one that does its work,
+						// needs what they import as much as what it imports itself. A program that uses the window manager already gets
+						// every component, so only one that does not looks at the libraries beside it; so does a .NET program, whose
+						// assemblies fill its folder.
+						const bool assembly = entry->image.directories[14].address && entry->image.directories[14].size;
+						if (!names.contains("user32.dll") && !assembly) {
+							std::error_code error;
+							size_t seen = 0;
+							for (const auto &item : std::filesystem::directory_iterator(std::filesystem::absolute(argv[first_file]).parent_path(), error)) {
+								if (++seen > 256)
+									break;
+								const auto file = lower(item.path().filename().string());
+								if (!file.ends_with(".dll") || !item.is_regular_file(error) || item.file_size(error) > 32 * 1024 * 1024)
+									continue;
+								try {
+									if (const auto bytes = source(file)) {
+										const raven::PEImage image(*bytes);
+										visit(image.imports());
+										for (const auto &descriptor : image.delay_imports())
+											visit(descriptor.imports);
+									}
+								} catch (const std::exception &) {
+								}
+							}
+						}
+						// A file under an imported name that is not an image adds no names here; the loader reports it if the program
+						// loads it.
 						while (!pending.empty()) {
 							const auto name = pending.back();
 							pending.pop_back();
-							if (const auto bytes = source(name))
-							{
-								const raven::PEImage image(*bytes);
-								visit(image.imports());
-								// A library the program loads lazily still needs its components in place.
-								for (const auto &descriptor : image.delay_imports())
-									visit(descriptor.imports);
+							try {
+								if (const auto bytes = source(name)) {
+									const raven::PEImage image(*bytes);
+									visit(image.imports());
+									// A library the program loads lazily still needs its components in place.
+									for (const auto &descriptor : image.delay_imports())
+										visit(descriptor.imports);
+								}
+							} catch (const std::runtime_error &) {
 							}
 						}
 						return names;

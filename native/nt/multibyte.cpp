@@ -108,7 +108,6 @@ constexpr std::array<Decomposition,58> decompositions{{
 
 std::string encode_utf8(std::u16string_view text,bool replace_invalid)
 {
-	if (text.size()>32766) throw uint32_t(120);
 	if (text.empty()) return {};
 	uint32_t needed=0,written=0;
 	const auto status=RtlUnicodeToUTF8N(nullptr,0,&needed,text.data(),uint32_t(text.size()*2));
@@ -133,9 +132,10 @@ bool NativeEnvironment::multibyte_information(std::string_view name)
 		else if (code_page==1) code_page=437;
 		if (flags & ~15U) throw uint32_t(1004);
 		const auto *single=native_single_byte_page(code_page);
+		const auto *dbcs=native_double_byte_page(code_page);
 		const bool ascii=code_page==20127,latin1=code_page==28591;
-		if (code_page!=1252 && code_page!=65001 && !single && !ascii && !latin1) throw uint32_t(120);
-		constexpr size_t limit=1024*1024;
+		if (code_page!=1252 && code_page!=65001 && !single && !dbcs && !ascii && !latin1) throw uint32_t(120);
+		constexpr size_t limit=1024*1024*1024;
 		std::vector<uint8_t> input;
 		if (length>0) {
 			if (size_t(length)>limit) throw uint32_t(120);
@@ -154,7 +154,11 @@ bool NativeEnvironment::multibyte_information(std::string_view name)
 		}
 		std::u16string text;
 		bool invalid=false,insufficient=false;
-		if (code_page==1252 || single || ascii || latin1) {
+		if (dbcs) {
+			text=decode_double_byte(*dbcs,std::string_view(reinterpret_cast<const char *>(input.data()),input.size()),&invalid);
+			result=text.size();
+			if (capacity && text.size()>size_t(capacity)) { text.resize(size_t(capacity));insufficient=true; }
+		} else if (code_page==1252 || single || ascii || latin1) {
 			text.reserve(input.size());
 			for (const auto byte:input) {
 				const auto value=ascii ? uint16_t(byte & 0x7f) : latin1 ? uint16_t(byte) : single ? single->bytes[byte] : native_mb1252[byte];

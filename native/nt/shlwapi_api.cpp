@@ -794,6 +794,43 @@ void register_shlwapi_api(ApiRegistry &registry, KernelContext &context)
 		call.ret(!path.empty() && root_length(path) == path.size());
 	});
 	registry.add("PathIsUNCW", 1, [](ApiCall &call) { call.ret(is_unc_root(call.wide(call[0]))); });
+	// The part two paths share, compared without case and ending at a whole component: C:\win\a and c:\win\b share C:\win, two
+	// paths on one drive share at least its root, and two UNC paths nothing unless their server is the same.
+	const auto common_prefix = [](const std::u16string &left, const std::u16string &right) {
+		const bool unc = left.starts_with(u"\\\\") && right.starts_with(u"\\\\");
+		size_t at = 0, common = 0;
+		while (at < left.size() && at < right.size() && upper_case(left[at]) == upper_case(right[at])) {
+			if (left[at] == u'\\' && !(unc && at < 2))
+				common = at == 2 && left[1] == u':' ? 3 : at;
+			++at;
+		}
+		const auto ends = [](const std::u16string &text, size_t at) { return at == text.size() || text[at] == u'\\'; };
+		if (ends(left, at) && ends(right, at))
+			common = at;
+		if (unc && left.find(u'\\', 2) != std::u16string::npos && common < left.find(u'\\', 2))
+			common = 0;
+		return common;
+	};
+	registry.add("PathCommonPrefixW", 3, [common_prefix](ApiCall &call) {
+		if (!call[0] || !call[1]) {
+			call.ret(0);
+			return;
+		}
+		const auto left = call.wide(call[0]);
+		const size_t common = common_prefix(left, call.wide(call[1]));
+		if (call[2])
+			call.put_wide(call[2], left.substr(0, common), 260);
+		call.ret(common);
+	});
+	// A prefix is a path the other one begins with, whole components and all.
+	registry.add("PathIsPrefixW", 2, [common_prefix](ApiCall &call) {
+		if (!call[0] || !call[1]) {
+			call.ret(0);
+			return;
+		}
+		const auto prefix = call.wide(call[0]);
+		call.ret(!prefix.empty() && common_prefix(prefix, call.wide(call[1])) == prefix.size());
+	});
 	registry.add("PathIsNetworkPathW", 1, [](ApiCall &call) { call.ret(is_unc_root(call.wide(call[0]))); });
 	registry.add("PathIsFileSpecW", 1, [](ApiCall &call) { call.ret(call.wide(call[0]).find_first_of(u"\\/:") == std::u16string::npos); });
 	registry.add("PathGetDriveNumberW", 1, [](ApiCall &call) {
@@ -880,6 +917,29 @@ void register_shlwapi_api(ApiRegistry &registry, KernelContext &context)
 		call.ret(0);
 	});
 	registry.add("PathCchCanonicalizeEx", 4, path_cch_canonicalize);
+	// PathAllocCanonicalize gives the same form in memory the caller frees with LocalFree. Only PATHCCH_ALLOW_LONG_PATHS lets the result
+	// pass MAX_PATH; a longer one is HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE).
+	registry.add("PathAllocCanonicalize", 3, [&context](ApiCall &call) {
+		if (call[2])
+			call.store_pointer(call[2], 0);
+		if (!call[0] || !call[2]) {
+			call.ret(0x80070057U);
+			return;
+		}
+		const auto result = canonical(call.wide(call[0]));
+		if (result.size() >= (call.u32(1) & 1 ? 32768U : max_path)) {
+			call.ret(0x800700ceU);
+			return;
+		}
+		const auto copy = context.allocator.allocate((result.size() + 1) * 2, false);
+		if (!copy) {
+			call.ret(0x8007000eU);
+			return;
+		}
+		call.put_wide(copy, result, result.size() + 1);
+		call.store_pointer(call[2], copy);
+		call.ret(0);
+	});
 	registry.add("PathAddBackslashW", 1, [](ApiCall &call) {
 		auto path = call.wide(call[0], max_path * 4);
 		if (path.empty() || separator(path.back())) {
@@ -935,6 +995,67 @@ void register_shlwapi_api(ApiRegistry &registry, KernelContext &context)
 				}
 			}
 			call.ret(call[0] + text.size() * unit);
+		});
+	// The way from one path to another: up from what is left of the first once their shared folders are gone, then down the second. Paths
+	// on different roots have none. The attributes say whether each end is a folder, whose whole name counts, or a file, whose name does not.
+	registry.add("PathRelativePathToW", 5, [](ApiCall &call) {
+		if (!call[0] || !call[1] || !call[3]) {
+			call.ret(0);
+			return;
+		}
+		const auto parts_of = [](std::u16string path, bool folder) {
+			std::vector<std::u16string> parts;
+			size_t at = 0;
+			while (at <= path.size()) {
+				const size_t end = std::min(path.find_first_of(u"\\/", at), path.size());
+				if (end > at)
+					parts.push_back(path.substr(at, end - at));
+				at = end + 1;
+			}
+			if (!folder && !parts.empty())
+				parts.pop_back();
+			return parts;
+		};
+		const auto same_part = [](const std::u16string &left, const std::u16string &right) {
+			return std::equal(left.begin(), left.end(), right.begin(), right.end(), [](char16_t a, char16_t b) {
+				return (a >= u'A' && a <= u'Z' ? char16_t(a + 32) : a) == (b >= u'A' && b <= u'Z' ? char16_t(b + 32) : b);
+			});
+		};
+		const auto from = parts_of(call.wide(call[1]), call.u32(2) & 0x10), to = parts_of(call.wide(call[3]), true);
+		size_t shared = 0;
+		while (shared < from.size() && shared < to.size() && same_part(from[shared], to[shared]))
+			++shared;
+		if (!shared) {
+			call.ret(0);
+			return;
+		}
+		std::u16string out;
+		for (size_t index = shared; index < from.size(); ++index)
+			out += out.empty() ? u".." : u"\\..";
+		for (size_t index = shared; index < to.size(); ++index)
+			out += (out.empty() ? u".\\" : u"\\") + to[index];
+		if (out.empty())
+			out = u".";
+		call.put_wide(call[0], out, max_path);
+		call.ret(1);
+	});
+	// The command line cut before its arguments, without the space that led to them.
+	for (const bool narrow : {false, true})
+		registry.add(narrow ? "PathRemoveArgsA" : "PathRemoveArgsW", 1, [narrow](ApiCall &call) {
+			if (call[0]) {
+				const size_t unit = narrow ? 1 : 2;
+				const auto text = narrow ? widen_ascii(call.narrow(call[0], max_path * 8)) : call.wide(call[0], max_path * 8);
+				bool quoted = false;
+				for (size_t at = 0; at < text.size(); ++at) {
+					if (text[at] == u'"')
+						quoted = !quoted;
+					else if (text[at] == u' ' && !quoted) {
+						call.write(call[0] + at * unit, std::vector<uint8_t>(unit));
+						break;
+					}
+				}
+			}
+			call.ret(0);
 		});
 	registry.add("PathMatchSpecW", 2, [](ApiCall &call) {
 		const auto file = call.wide(call[0]);

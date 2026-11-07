@@ -9,6 +9,8 @@
 #include <cwctype>
 #include <functional>
 #include <map>
+#include <optional>
+#include <span>
 
 namespace raven {
 
@@ -43,6 +45,27 @@ constexpr std::pair<std::u16string_view, uint32_t> known_locales[]{{u"ar", 0x01}
 	{u"fr-BE", 0x80c}, {u"it-CH", 0x810}, {u"nl-BE", 0x813}, {u"nn-NO", 0x814}, {u"pt-PT", 0x816}, {u"zh-HK", 0xc04}, {u"de-AT", 0xc07},
 	{u"en-AU", 0xc09}, {u"es-ES", 0xc0a}, {u"fr-CA", 0xc0c}, {u"en-CA", 0x1009}, {u"fr-CH", 0x100c}, {u"en-IE", 0x1809}, {u"sr-Latn-RS", 0x241a},
 	{u"sr-Cyrl-RS", 0x281a}, {u"en-IN", 0x4009}, {u"es-US", 0x540a}};
+// Every other locale identifier Windows defines, with the name it gives it; the list above wins where both name one.
+#include "locale_identifiers.inc"
+
+// The identifier of a locale name, or of the name of an identifier, in the list above first and then in the generated one.
+std::optional<uint32_t> identifier_of(std::u16string_view name)
+{
+	for (const auto &list : {std::span<const std::pair<std::u16string_view, uint32_t>>(known_locales), std::span<const std::pair<std::u16string_view, uint32_t>>(generated_locales)})
+		for (const auto &[known, locale] : list)
+			if (!compare_fold(name, known))
+				return locale;
+	return std::nullopt;
+}
+
+std::optional<std::u16string_view> name_of(uint32_t locale)
+{
+	for (const auto &list : {std::span<const std::pair<std::u16string_view, uint32_t>>(known_locales), std::span<const std::pair<std::u16string_view, uint32_t>>(generated_locales)})
+		for (const auto &[known, identifier] : list)
+			if (identifier == locale)
+				return known;
+	return std::nullopt;
+}
 
 const std::map<uint32_t, std::u16string> &locale_strings()
 {
@@ -206,6 +229,8 @@ std::u16string decode_ansi(std::string_view text, uint32_t code_page)
 		return from_utf8(text);
 	if (const auto *page = native_single_byte_page(code_page))
 		return decode_single_byte(*page, text);
+	if (const auto *page = native_double_byte_page(code_page))
+		return decode_double_byte(*page, text);
 	std::u16string result;
 	for (const auto byte : text) {
 		const auto value = static_cast<unsigned char>(byte);
@@ -381,7 +406,10 @@ std::optional<std::u16string> system_message(uint32_t id)
 		{0x80092004U, u"Cannot find object or property."}, {0x80092009U, u"Cannot find the requested object."}, {0x80091004U, u"Invalid cryptographic message type."},
 		{0x80090008U, u"The parameter is incorrect."}, {0x80090016U, u"Keyset does not exist"},
 	};
-	const auto found = messages.find(id);
+	// An HRESULT of the Win32 facility words the error it carries.
+	auto found = messages.find(id);
+	if (found == messages.end() && (id & 0xffff0000U) == 0x80070000U)
+		found = messages.find(id & 0xffffU);
 	if (found == messages.end())
 		return std::nullopt;
 	return std::u16string(found->second) + u"\r\n";
@@ -435,7 +463,8 @@ std::u16string insert_arguments(std::u16string_view text, const std::function<st
 }
 
 // The text of message `id` in a module's message table, the RT_MESSAGETABLE resource named 1: blocks of consecutive identifiers, each
-// pointing at entries that carry their length and whether they are UTF-16. The language asked for is preferred, any other serves.
+// pointing at entries that carry their length and whether they are UTF-16. The language asked for goes first, then its neutral form,
+// its other regions, the unmarked table and English; only then does any other serve.
 std::optional<std::u16string> module_message(KernelContext &context, uint64_t base, uint32_t id, uint32_t language)
 {
 	const PEModule *image = !base || base == context.entry.loaded.base() ? &context.entry : nullptr;
@@ -449,10 +478,26 @@ std::optional<std::u16string> module_message(KernelContext &context, uint64_t ba
 		return std::nullopt;
 	const auto resources = read_resources(directory, context.process.read_memory(image->loaded.base() + directory.address, directory.size),
 		image->image.image_size);
+	const uint32_t wanted = language ? language : 0x409;
+	const auto rank = [&](uint32_t candidate) {
+		if (candidate == wanted)
+			return 0;
+		if (candidate == (wanted & 0x3ff))
+			return 1;
+		if ((candidate & 0x3ff) == (wanted & 0x3ff))
+			return 2;
+		if (!candidate)
+			return 3;
+		if (candidate == 0x409)
+			return 4;
+		if (candidate == 9)
+			return 5;
+		return (candidate & 0x3ff) == 9 ? 6 : 7;
+	};
 	const PEResource *table = nullptr;
 	for (const auto &resource : resources)
 		if (resource.type == ResourceKey(uint32_t(11)) && resource.name == ResourceKey(uint32_t(1)) &&
-			(!table || (language && resource.language == language)))
+			(!table || rank(resource.language) < rank(table->language)))
 			table = &resource;
 	if (!table || table->size < 4)
 		return std::nullopt;
@@ -680,13 +725,14 @@ std::optional<std::u16string> idn_to_unicode(const std::u16string &name)
 
 }
 
-std::vector<uint8_t> locale_table()
+std::vector<uint8_t> locale_table(bool names)
 {
 	std::vector<uint8_t> table(locale_table_entries * 8, 0xff);
 	std::u16string pool;
 	for (uint32_t index = 0; index < locale_table_entries; ++index) {
-		// The locale's own name and its parent's depend on the locale asked for, which the served block does not read: the runtime answers.
-		if (index == 0x5c || index == 0x6d)
+		// The locale's own name and its parent's depend on the name GetLocaleInfoEx is given, which its prelude does not read: the runtime
+		// answers them. GetLocaleInfoW answers them for the one locale whatever its number, so its table holds them.
+		if (!names && (index == 0x5c || index == 0x6d))
 			continue;
 		const auto text = locale_text(index < 0x80 ? index : 0x1000 + index - 0x80);
 		if (!text)
@@ -744,13 +790,20 @@ void register_text_api(ApiRegistry &registry, KernelContext &context)
 		call.put_narrow(call[0], text.substr(0, size_t(capacity) - 1), size_t(capacity));
 		call.ret(call[0]);
 	});
-	registry.add("lstrcmpW", 2, [](ApiCall &call) { call.ret(uint32_t(collate(call.wide(call[0]), call.wide(call[1]), 0))); });
-	registry.add("lstrcmpiW", 2, [](ApiCall &call) { call.ret(uint32_t(collate(call.wide(call[0]), call.wide(call[1]), 1))); });
-	registry.add("lstrcmpiA", 2, [](ApiCall &call) {
-		call.ret(uint32_t(collate(widen_ascii(call.narrow(call[0])), widen_ascii(call.narrow(call[1])), 1)));
+	// The lstrcmp family takes a null pointer for a string that comes before every other, as Windows does, rather than failing.
+	const auto ordered = [](ApiCall &call, auto compare) {
+		if (!call[0] || !call[1])
+			call.ret(call[0] == call[1] ? 0 : call[0] ? 1 : UINT32_MAX);
+		else
+			call.ret(uint32_t(compare()));
+	};
+	registry.add("lstrcmpW", 2, [ordered](ApiCall &call) { ordered(call, [&] { return collate(call.wide(call[0]), call.wide(call[1]), 0); }); });
+	registry.add("lstrcmpiW", 2, [ordered](ApiCall &call) { ordered(call, [&] { return collate(call.wide(call[0]), call.wide(call[1]), 1); }); });
+	registry.add("lstrcmpiA", 2, [ordered](ApiCall &call) {
+		ordered(call, [&] { return collate(widen_ascii(call.narrow(call[0])), widen_ascii(call.narrow(call[1])), 1); });
 	});
-	registry.add("lstrcmpA", 2, [](ApiCall &call) {
-		call.ret(uint32_t(collate(widen_ascii(call.narrow(call[0])), widen_ascii(call.narrow(call[1])), 0)));
+	registry.add("lstrcmpA", 2, [ordered](ApiCall &call) {
+		ordered(call, [&] { return collate(widen_ascii(call.narrow(call[0])), widen_ascii(call.narrow(call[1])), 0); });
 	});
 
 	registry.add("WideCharToMultiByte", 8, [&, ansi_page](ApiCall &call) {
@@ -773,6 +826,27 @@ void register_text_api(ApiRegistry &registry, KernelContext &context)
 				const auto byte = encode_single_byte(*single, character, exact);
 				encoded.push_back(byte < 0 ? '?' : char(byte));
 				replaced |= byte < 0;
+			}
+		} else if (const auto *dbcs = native_double_byte_page(page)) {
+			// The caller's default character replaces one the page lacks: its first character, of one byte or two.
+			std::string fallback(1, char(dbcs->default_byte));
+			if (call[6]) {
+				const auto given = call.read(call[6], 1);
+				fallback.assign(1, char(given[0]));
+				if (dbcs->slots[given[0]])
+					fallback.push_back(char(call.read(call[6] + 1, 1)[0]));
+			}
+			const bool exact = call.u32(1) & 0x400;
+			for (const auto character : source) {
+				const auto bytes = encode_double_byte(*dbcs, character, exact);
+				if (bytes < 0) {
+					encoded += fallback;
+					replaced = true;
+				} else {
+					if (bytes > 0xff)
+						encoded.push_back(char(bytes >> 8));
+					encoded.push_back(char(bytes));
+				}
 			}
 		} else if (page == 1252 || page == 28591 || page == 20127) {
 			encoded = encode_ansi(source, 1252);
@@ -1059,7 +1133,23 @@ void register_text_api(ApiRegistry &registry, KernelContext &context)
 		{437, 1, "OEM United States"}, {850, 1, "OEM Multilingual Latin 1"}, {1250, 1, "Central European (Windows)"}, {1251, 1, "Cyrillic (Windows)"},
 		{1252, 1, "Western European (Windows)"}, {1253, 1, "Greek (Windows)"}, {1254, 1, "Turkish (Windows)"}, {1255, 1, "Hebrew (Windows)"},
 		{1256, 1, "Arabic (Windows)"}, {1257, 1, "Baltic (Windows)"}, {1258, 1, "Vietnamese (Windows)"},
+		{932, 2, "Japanese (Shift-JIS)"}, {936, 2, "Chinese Simplified (GBK)"}, {949, 2, "Korean"}, {950, 2, "Chinese Traditional (Big5)"},
 		{28591, 1, "Western European (ISO)"}, {20127, 1, "US-ASCII"}, {65001, 4, "Unicode (UTF-8)"}
+	};
+	// CPINFO and CPINFOEX share their start: the longest character, the default character, then the lead byte ranges. CPINFOEX
+	// goes on with the default Unicode character.
+	const auto describe = [](const CodePage &page, std::vector<uint8_t> &bytes) {
+		std::memcpy(bytes.data(), &page.maximum, 4);
+		bytes[4] = '?';
+		if (const auto *dbcs = native_double_byte_page(page.id)) {
+			bytes[4] = uint8_t(dbcs->default_byte);
+			std::memcpy(bytes.data() + 6, dbcs->ranges, 12);
+		}
+		if (bytes.size() > 20) {
+			const auto *dbcs = native_double_byte_page(page.id);
+			const uint16_t wide = dbcs ? dbcs->default_wide : u'?';
+			std::memcpy(bytes.data() + 18, &wide, 2);
+		}
 	};
 	const auto code_page = [](uint32_t page) -> const CodePage * {
 		if (page == 0 || page == 3) page = 1252;
@@ -1068,20 +1158,19 @@ void register_text_api(ApiRegistry &registry, KernelContext &context)
 			if (entry.id == page) return &entry;
 		return nullptr;
 	};
-	registry.add("GetCPInfo", 2, [code_page](ApiCall &call) {
+	registry.add("GetCPInfo", 2, [code_page, describe](ApiCall &call) {
 		const auto page = code_page(call.u32(0));
 		if (!page || !call[1]) {
 			call.fail(87);
 			return;
 		}
 		std::vector<uint8_t> bytes(20);
-		std::memcpy(bytes.data(), &page->maximum, 4);
-		bytes[4] = '?';
+		describe(*page, bytes);
 		call.write(call[1], bytes);
 		call.ret(1);
 	});
 	for (const auto suffix : {std::string("A"), std::string("W")}) {
-		registry.add("GetCPInfoEx" + suffix, 3, [code_page, suffix](ApiCall &call) {
+		registry.add("GetCPInfoEx" + suffix, 3, [code_page, describe, suffix](ApiCall &call) {
 			const auto page = code_page(call.u32(0));
 			if (!page || call.u32(1) || !call[2]) {
 				call.fail(87);
@@ -1089,9 +1178,7 @@ void register_text_api(ApiRegistry &registry, KernelContext &context)
 			}
 			const size_t width = suffix == "W" ? 2 : 1;
 			std::vector<uint8_t> bytes(24 + 260 * width);
-			std::memcpy(bytes.data(), &page->maximum, 4);
-			bytes[4] = '?';
-			bytes[18] = '?';
+			describe(*page, bytes);
 			std::memcpy(bytes.data() + 20, &page->id, 4);
 			for (size_t index = 0; page->name[index]; ++index)
 				bytes[24 + index * width] = uint8_t(page->name[index]);
@@ -1102,7 +1189,7 @@ void register_text_api(ApiRegistry &registry, KernelContext &context)
 	registry.add("IsValidCodePage", 1, [](ApiCall &call) {
 		const uint32_t page = call.u32(0);
 		call.ret(page == 437 || page == 850 || page == 1252 || page == 28591 || page == 20127 || page == 65001 || page == 1200 || page == 1201 ||
-			native_single_byte_page(page) != nullptr);
+			native_single_byte_page(page) != nullptr || native_double_byte_page(page) != nullptr);
 	});
 	registry.add("GetOEMCP", 0, [](ApiCall &call) { call.ret(437); });
 
@@ -1161,11 +1248,10 @@ void register_text_api(ApiRegistry &registry, KernelContext &context)
 			call.ret(0x409);
 			return;
 		}
-		for (const auto &[known, locale] : known_locales)
-			if (!compare_fold(name, known)) {
-				call.ret(locale);
-				return;
-			}
+		if (const auto locale = identifier_of(name)) {
+			call.ret(*locale);
+			return;
+		}
 		call.fail(87);
 	});
 	registry.add("LCIDToLocaleName", 4, [](ApiCall &call) {
@@ -1174,12 +1260,12 @@ void register_text_api(ApiRegistry &registry, KernelContext &context)
 		if (locale == 0 || locale == 0x400 || locale == 0x800)
 			name = u"en-US";
 		else if (locale != 0x7f) {
-			const auto known = std::find_if(std::begin(known_locales), std::end(known_locales), [locale](const auto &entry) { return entry.second == locale; });
-			if (known == std::end(known_locales)) {
+			const auto known = name_of(locale);
+			if (!known) {
 				call.fail(87);
 				return;
 			}
-			name = known->first;
+			name = *known;
 		}
 		const int32_t capacity = call.i32(2);
 		if (capacity && size_t(capacity) <= name.size()) {
@@ -1274,6 +1360,24 @@ void register_text_api(ApiRegistry &registry, KernelContext &context)
 			return;
 		}
 		locale_info(call, call.u32(1), call[2], call.i32(3), true);
+	});
+	// The one user interface language: by number unless the flags ask for its name.
+	registry.add("EnumUILanguagesW", 3, [&](ApiCall &call) {
+		const auto scratch = memory.allocate(0, 4096, 0x3000, 4);
+		if (scratch.status) {
+			call.fail(8);
+			return;
+		}
+		const std::u16string name = call.u32(1) & 8 ? u"en-US" : u"0409";
+		std::vector<uint8_t> bytes((name.size() + 1) * 2);
+		std::memcpy(bytes.data(), name.data(), name.size() * 2);
+		call.write(scratch.address, bytes);
+		const uint64_t arguments[] = {scratch.address, call[2]};
+		const auto result = context.call(call[0], arguments);
+		memory.free(scratch.address, 0, 0x8000);
+		if (result.stop != NativeStop::returned)
+			throw result;
+		call.ret(1);
 	});
 	registry.add("EnumSystemLocalesW", 2, [&](ApiCall &call) {
 		const auto scratch = memory.allocate(0, 4096, 0x3000, 4);

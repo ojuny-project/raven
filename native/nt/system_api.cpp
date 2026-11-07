@@ -2,6 +2,7 @@
 #include "kernel_context.h"
 #include "actctx.h"
 #include "text.h"
+#include "x86_compat_api.h"
 
 #include <algorithm>
 #include <array>
@@ -292,6 +293,29 @@ uint64_t counter_ticks()
 	timespec now{};
 	::clock_gettime(CLOCK_MONOTONIC, &now);
 	return uint64_t(now.tv_sec) * 10000000ULL + uint64_t(now.tv_nsec) / 100;
+}
+
+// The local time at the start of the current second and the performance counter span of that second, for a GetLocalTime the
+// guest answers itself: the counter where the second starts and ends, then the SYSTEMTIME with no milliseconds.
+std::array<uint64_t, 4> local_second()
+{
+	const uint64_t counter = counter_ticks(), utc = now_ticks();
+	const auto zone = zone_at(time_t((utc - filetime_epoch_offset) / 10000000ULL));
+	const uint64_t local = utc + int64_t(zone.offset_minutes) * 600000000LL, into = local % 10000000ULL;
+	std::array<uint64_t, 4> second{counter - into, counter - into + 10000000ULL, 0, 0};
+	std::memcpy(&second[2], system_time(local - into).data(), 16);
+	return second;
+}
+
+// The service pack of a version block: its name after the five numbers, and its number in the extended block.
+static void fill_service_pack(std::vector<uint8_t> &bytes, uint32_t pack)
+{
+	if (!pack)
+		return;
+	const std::u16string name = u"Service Pack " + std::u16string(1, char16_t(u'0' + pack));
+	std::memcpy(bytes.data() + 20, name.data(), name.size() * 2);
+	if (bytes.size() >= 284)
+		bytes[276] = uint8_t(pack);
 }
 
 void register_system_api(ApiRegistry &registry, KernelContext &context)
@@ -627,6 +651,7 @@ void register_system_api(ApiRegistry &registry, KernelContext &context)
 		const uint32_t fields[5] = {size, version.major, version.minor, version.build, 2};
 		std::memcpy(bytes.data(), fields, 20);
 		// The extended block adds the service pack, the suite mask and the product type: a workstation.
+		fill_service_pack(bytes, version.service_pack);
 		if (size == 284)
 			bytes[282] = 1;
 		call.write(call[0], bytes);
@@ -644,6 +669,7 @@ void register_system_api(ApiRegistry &registry, KernelContext &context)
 		const auto version = activation_contexts().system_version();
 		const uint32_t fields[5] = {size, version.major, version.minor, version.build, 2};
 		std::memcpy(bytes.data(), fields, 20);
+		fill_service_pack(bytes, version.service_pack);
 		if (bytes.size() == 284)
 			bytes[282] = 1;
 		call.write(call[0], bytes);
@@ -662,6 +688,18 @@ void register_system_api(ApiRegistry &registry, KernelContext &context)
 		}
 		call.put_wide(call[2], family, family_size / 2);
 		call.put_wide(call[3], form, form_size / 2);
+		call.ret(0);
+	});
+	// The same as numbers: the version packed as major, minor, build and revision words, DEVICEFAMILYINFOENUM_DESKTOP and
+	// DEVICEFAMILYDEVICEFORM_UNKNOWN. Each pointer may be null.
+	registry.add("RtlGetDeviceFamilyInfoEnum", 3, [](ApiCall &call) {
+		const auto version = activation_contexts().system_version();
+		if (call[0])
+			call.store<uint64_t>(call[0], uint64_t(version.major) << 48 | uint64_t(version.minor) << 32 | uint64_t(version.build & 0xffff) << 16);
+		if (call[1])
+			call.store<uint32_t>(call[1], 3);
+		if (call[2])
+			call.store<uint32_t>(call[2], 0);
 		call.ret(0);
 	});
 	// The licensing policy store holds no values: every query answers SL_E_VALUE_NOT_FOUND.
@@ -1003,9 +1041,55 @@ void register_system_api(ApiRegistry &registry, KernelContext &context)
 		call.store_pointer(call[2], processor_mask());
 		call.ret(1);
 	});
+	// The process runs in group 0 alone: the count goes back even when the array is too small for it.
+	registry.add("GetProcessGroupAffinity", 3, [](ApiCall &call) {
+		if (!call[1]) {
+			call.fail(87);
+			return;
+		}
+		const uint16_t capacity = call.load<uint16_t>(call[1]);
+		call.store<uint16_t>(call[1], 1);
+		if (!capacity || !call[2]) {
+			call.fail(122);
+			return;
+		}
+		call.store<uint16_t>(call[2], 0);
+		call.ret(1);
+	});
+	// GROUP_AFFINITY: a pointer-sized mask, the group and three reserved words.
+	registry.add("GetThreadGroupAffinity", 2, [processor_mask](ApiCall &call) {
+		if (!call[1]) {
+			call.fail(87);
+			return;
+		}
+		std::vector<uint8_t> affinity(call.pointer_width() + 8, 0);
+		const uint64_t mask = processor_mask();
+		for (size_t index = 0; index < call.pointer_width(); ++index)
+			affinity[index] = uint8_t(mask >> (index * 8));
+		call.write(call[1], affinity);
+		call.ret(1);
+	});
+	registry.add("GetActiveProcessorGroupCount", 0, [](ApiCall &call) { call.ret(1); });
+	registry.add("GetMaximumProcessorGroupCount", 0, [](ApiCall &call) { call.ret(1); });
+	// Group 0, or every group (0xffff), holds all the processors; any other group has none.
+	for (const char *name : {"GetActiveProcessorCount", "GetMaximumProcessorCount"})
+		registry.add(name, 1, [](ApiCall &call) {
+			const uint16_t group = uint16_t(call[0]);
+			call.ret(group && group != 0xffff ? 0 : uint32_t(std::clamp<long>(::sysconf(_SC_NPROCESSORS_ONLN), 1, 64)));
+		});
 	// Affinity is not enforced: the call reports the mask the thread had, which is every processor.
 	registry.add("SetProcessAffinityMask", 2, [](ApiCall &call) { call.ret(1); });
 	registry.add("SetProcessShutdownParameters", 2, [](ApiCall &call) { call.ret(1); });
+	// The level a process starts with (0x280) and no flags, as nothing changes them here.
+	registry.add("GetProcessShutdownParameters", 2, [](ApiCall &call) {
+		if (!call[0] || !call[1]) {
+			call.fail(998);
+			return;
+		}
+		call.store<uint32_t>(call[0], 0x280);
+		call.store<uint32_t>(call[1], 0);
+		call.ret(1);
+	});
 	// Processor topology: one package, one core per logical processor, no cache or NUMA records beyond the single node.
 	registry.add("GetLogicalProcessorInformationEx", 3, [processor_mask](ApiCall &call) {
 		constexpr uint32_t core = 0, node = 1, package = 3, group = 4, all = 0xffff;
@@ -1390,6 +1474,8 @@ void register_system_api(ApiRegistry &registry, KernelContext &context)
 		call.ret(head);
 	});
 	registry.add("QueryDepthSList", 1, [count](ApiCall &call) { call.ret(count(call) & 0xffff); });
+	// The entry at the head, left on the list.
+	registry.add("RtlFirstEntrySList", 1, [](ApiCall &call) { call.ret(call.load_pointer(call[0])); });
 	// ntdll's names for the same lists.
 	for (const auto &[native, win32] : {std::pair{"RtlInitializeSListHead", "InitializeSListHead"},
 			{"RtlInterlockedPushEntrySList", "InterlockedPushEntrySList"}, {"RtlInterlockedPopEntrySList", "InterlockedPopEntrySList"},
@@ -1611,6 +1697,21 @@ void register_system_api(ApiRegistry &registry, KernelContext &context)
 	// The compatibility layer a program was started with changes the version Windows reports to it.
 	if (const auto layer = variables->values.find(u"__COMPAT_LAYER"); layer != variables->values.end())
 		activation_contexts().set_compatibility_layer(layer->second.second);
+	else if (const auto slash = context.launch.image_path.find_last_of(u"\\/"); slash != std::u16string::npos) {
+		// The .NET Framework 4.8 setup ends with "already installed" on the Windows 10 this system reports, which has it built in. Here the
+		// framework is not there yet, so the setup and the package that unpacks it are told the oldest Windows it installs on, where
+		// they unpack and install everything.
+		auto name = context.launch.image_path.substr(slash + 1);
+		for (auto &character : name)
+			character = upper_case(character);
+		const auto folder = context.launch.image_path.substr(0, slash + 1);
+		const auto resolved = paths.resolve(folder + u"netfx_Patch_x64.msp");
+		if (name.starts_with(u"NDP48") || (name == u"SETUP.EXE" && resolved && resolved->exists)) {
+			activation_contexts().set_compatibility_layer(u"WIN7SP1");
+			// The setup is a 32-bit program that reads its package catalog with about a million heap calls.
+			want_guest_heap();
+		}
+	}
 	paths.set_search_path([variables] {
 		const auto found = variables->values.find(u"PATH");
 		return found == variables->values.end() ? std::u16string() : found->second.second;
@@ -1707,11 +1808,34 @@ void register_system_api(ApiRegistry &registry, KernelContext &context)
 		call.write(address, bytes);
 		call.ret(address);
 	});
+	// The one user here has no environment apart from the process's own, so a user's block is a copy of it.
+	registry.add("CreateEnvironmentBlock", 3, [&, variables](ApiCall &call) {
+		std::u16string block;
+		for (const auto &[key, entry] : variables->values) {
+			block += entry.first + u"=" + entry.second;
+			block.push_back(0);
+		}
+		block.push_back(0);
+		const auto address = context.allocator.allocate(block.size() * 2);
+		if (!address || !call[0]) {
+			call.fail(address ? 87 : 8);
+			return;
+		}
+		std::vector<uint8_t> bytes(block.size() * 2);
+		std::memcpy(bytes.data(), block.data(), bytes.size());
+		call.write(address, bytes);
+		call.store_pointer(call[0], address);
+		call.ret(1);
+	});
+	registry.add("DestroyEnvironmentBlock", 1, [&](ApiCall &call) {
+		call.ret(context.allocator.release(call[0]));
+	});
 	registry.add("FreeEnvironmentStringsW", 1, [&](ApiCall &call) {
 		call.ret(context.allocator.release(call[0]));
 	});
 
-	// TLS and FLS indexes are process-wide; values belong to the thread whose TEB asks.
+	// TLS and FLS indexes are process-wide; values belong to the thread that asks, by its id: a new thread may get the thread block of one
+	// that ended, and must not find that thread's values.
 	struct Slots {
 		std::vector<bool> used;
 		std::vector<uint64_t> callbacks;
@@ -1791,7 +1915,7 @@ void register_system_api(ApiRegistry &registry, KernelContext &context)
 				call.fail(87);
 				return;
 			}
-			auto &values = slots->values[environment.teb()];
+			auto &values = slots->values[environment.thread_id()];
 			call.set_last_error(0);
 			call.ret(index < values.size() ? values[index] : 0);
 		};
@@ -1805,7 +1929,7 @@ void register_system_api(ApiRegistry &registry, KernelContext &context)
 				call.fail(87);
 				return;
 			}
-			auto &values = slots->values[environment.teb()];
+			auto &values = slots->values[environment.thread_id()];
 			if (values.size() < slots->used.size())
 				values.resize(slots->used.size());
 			values[index] = call[1];

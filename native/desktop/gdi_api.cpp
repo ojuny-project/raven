@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <new>
+#include <utility>
 
 namespace raven {
 
@@ -156,7 +157,7 @@ void NativeDesktop::register_gdi_api(ApiRegistry &registry)
 			state.origin_x = dc.origin_x; state.origin_y = dc.origin_y; state.position_x = dc.position_x; state.position_y = dc.position_y;
 			state.brush_org_x = dc.brush_org_x; state.brush_org_y = dc.brush_org_y; state.window_org_x = dc.window_org_x;
 			state.window_org_y = dc.window_org_y; state.viewport_org_x = dc.viewport_org_x; state.viewport_org_y = dc.viewport_org_y;
-			state.graphics_mode = dc.graphics_mode; state.world = dc.world;
+			state.graphics_mode = dc.graphics_mode; state.stretch_mode = dc.stretch_mode; state.world = dc.world;
 			dc.saved.push_back(std::move(state));
 			call.ret(dc.saved.size());
 		});
@@ -181,7 +182,7 @@ void NativeDesktop::register_gdi_api(ApiRegistry &registry)
 			dc.brush_org_x = state.brush_org_x; dc.brush_org_y = state.brush_org_y; dc.window_org_x = state.window_org_x;
 			dc.window_org_y = state.window_org_y; dc.viewport_org_x = state.viewport_org_x; dc.viewport_org_y = state.viewport_org_y;
 			dc.user_dx = state.viewport_org_x - state.window_org_x; dc.user_dy = state.viewport_org_y - state.window_org_y;
-			dc.graphics_mode = state.graphics_mode; dc.world = state.world;
+			dc.graphics_mode = state.graphics_mode; dc.stretch_mode = state.stretch_mode; dc.world = state.world;
 			call.ret(1);
 		});
 	});
@@ -315,11 +316,18 @@ void NativeDesktop::register_gdi_api(ApiRegistry &registry)
 			call.ret(1);
 		});
 	});
+	// BLACKONWHITE, WHITEONBLACK, COLORONCOLOR or HALFTONE; the previous mode comes back.
 	registry.add("SetStretchBltMode", 2, [=, this](ApiCall &call) {
 		guarded(call, 0, [&] {
-			require_dc(call, 0);
-			call.ret(1);
+			auto &dc = require_dc(call, 0);
+			const uint32_t mode = call.u32(1);
+			if (mode < 1 || mode > 4)
+				throw uint32_t(87);
+			call.ret(std::exchange(dc.stretch_mode, mode));
 		});
+	});
+	registry.add("GetStretchBltMode", 1, [=, this](ApiCall &call) {
+		guarded(call, 0, [&] { call.ret(require_dc(call, 0).stretch_mode); });
 	});
 	registry.add("SetBrushOrgEx", 4, [=, this](ApiCall &call) {
 		guarded(call, 0, [&] {
@@ -445,6 +453,28 @@ void NativeDesktop::register_gdi_api(ApiRegistry &registry)
 			palette.entries.resize(count);
 			for (uint32_t i = 0; i < count; ++i)
 				palette.entries[i] = call.load<uint32_t>(call[0] + 4 + uint64_t(i) * 4) & 0xffffff;
+			const auto handle = objects.add(std::move(palette));
+			if (!handle)
+				throw uint32_t(8);
+			call.ret(handle);
+		});
+	});
+	// The 256 colours GDI halftones to: the ten fixed colours at each end, a 6x6x6 cube and a grey ramp between them.
+	registry.add("CreateHalftonePalette", 1, [=, this](ApiCall &call) {
+		guarded(call, 0, [&] {
+			static constexpr uint32_t first[10] = {0x000000, 0x000080, 0x008000, 0x008080, 0x800000, 0x800080, 0x808000, 0xc0c0c0, 0xc0dcc0, 0xf0caa6};
+			static constexpr uint32_t last[10] = {0xf0fbff, 0xa4a0a0, 0x808080, 0x0000ff, 0x00ff00, 0x00ffff, 0xff0000, 0xff00ff, 0xffff00, 0xffffff};
+			DesktopPalette palette;
+			palette.entries.assign(first, first + 10);
+			for (uint32_t b = 0; b < 6; ++b)
+				for (uint32_t g = 0; g < 6; ++g)
+					for (uint32_t r = 0; r < 6; ++r)
+						palette.entries.push_back(r * 51 | g * 51 << 8 | b * 51 << 16);
+			for (uint32_t i = 1; i <= 20; ++i) {
+				const uint32_t grey = i * 255 / 21;
+				palette.entries.push_back(grey | grey << 8 | grey << 16);
+			}
+			palette.entries.insert(palette.entries.end(), last, last + 10);
 			const auto handle = objects.add(std::move(palette));
 			if (!handle)
 				throw uint32_t(8);
@@ -1842,7 +1872,8 @@ void NativeDesktop::register_image_api(ApiRegistry &registry)
 		guarded(call, 0, [&] {
 			if (!call[0])
 				throw uint32_t(120);
-			call.ret(icon_resource(call, call[0], wide_name(call, call[1], true), 0, 0));
+			const auto display = objects.display();
+			call.ret(icon_resource(call, call[0], wide_name(call, call[1], true), uint32_t(display.width), uint32_t(display.height)));
 		});
 	});
 	registry.add("LoadCursorA", 2, [=, this](ApiCall &call) {

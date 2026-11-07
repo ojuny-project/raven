@@ -215,6 +215,8 @@ public:
 						// A collided unwind: the handler belongs to a frame that stands for another dispatch, such as the stub that
 						// the .NET runtime raises a fault from, and has copied that dispatch's state into the dispatcher context. The
 						// search goes on with that frame's handler and, after it, from the frame's caller the context describes.
+						// See DISPATCHER_CONTEXT in Microsoft's "x64 exception handling" for the layout, and ExceptionCollidedUnwind in
+						// CoreCLR's exceptionhandling.cpp (MIT) for what the runtime expects of the dispatcher.
 						descriptor = context.process.read_memory(dispatcher, dispatcher_size);
 						next = context.process.read_memory(load64(descriptor, 0x28), x64_context::size);
 						context.process.write_memory(frame_context, next);
@@ -298,7 +300,7 @@ public:
 						standard = standard || name == ".?AVexception@std@@";
 						std::fprintf(stderr, " %s", name.c_str());
 					}
-					const auto bytes = context.process.read_memory(object, 32);
+					const auto bytes = context.process.read_memory(object, 64);
 					std::fprintf(stderr, "\nraven:   object");
 					for (size_t at = 0; at < bytes.size(); at += 8) {
 						uint64_t value = 0;
@@ -312,6 +314,25 @@ public:
 					if (standard && message) {
 						const auto text = context.process.read_memory(message, 200);
 						std::fprintf(stderr, "raven:   what %s\n", std::string(reinterpret_cast<const char *>(text.data()), strnlen(reinterpret_cast<const char *>(text.data()), text.size())).c_str());
+					}
+					// A program's own error object names its message too: any field pointing at narrow or wide text shows it.
+					for (size_t at = 8; at < bytes.size(); at += 8) {
+						uint64_t field = 0;
+						std::memcpy(&field, bytes.data() + at, 8);
+						if (field < 0x10000 || field >= 0x800000000000ULL)
+							continue;
+						try {
+							const auto text = context.process.read_memory(field, 240);
+							std::string narrow, wide;
+							for (size_t index = 0; index < text.size() && text[index] >= 0x20 && text[index] < 0x7f; ++index)
+								narrow.push_back(char(text[index]));
+							for (size_t index = 0; index + 1 < text.size() && text[index] >= 0x20 && text[index] < 0x7f && !text[index + 1]; index += 2)
+								wide.push_back(char(text[index]));
+							const auto &shown = wide.size() >= 4 ? wide : narrow;
+							if (shown.size() >= 4)
+								std::fprintf(stderr, "raven:   text +%zx %s\n", at, shown.c_str());
+						} catch (const std::exception &) {
+						}
 					}
 				} catch (const std::exception &) {
 				}
