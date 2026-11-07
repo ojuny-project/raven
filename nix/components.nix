@@ -273,46 +273,25 @@ CLSID_EOF
     hash = "sha256-ofmQJl6050CmoPpP97QSPVodzh348BdOniBXUF8f1+8=";
   };
 
-  skiaDeps = pkgs.stdenv.mkDerivation {
-    pname = "raven-skia-deps";
-    version = "a21aae";
-
-    src = skiaSource;
-
-    nativeBuildInputs = [
-      pkgs.git
-      pkgs.python3
-      pkgs.cacert
-    ];
-
-    outputHashMode = "recursive";
-    outputHashAlgo = "sha256";
-    outputHash = "sha256-ZBOGqU6BC9gRRGeBxthq/oF7MCnwzV+VruIE7R5nr2A=";
-
-    buildPhase = ''
-      export HOME=$TMPDIR
-      export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
-      export GIT_SYNC_DEPS_SKIP_EMSDK=1
-      git config --global url."https://".insteadOf git://
-      sed -i '/thread.start()/a\    thread.join()' tools/git-sync-deps
-      python3 tools/git-sync-deps
-    '';
-
-    installPhase = ''
-      mkdir -p $out
-      cp -a . $out/
-      find $out -type d -name .git -prune -exec rm -rf {} +
-      rm -rf $out/bin $out/tools $out/infra $out/site $out/docs $out/resources
-      rm -rf $out/tests $out/testdata $out/bench $out/gm $out/fuzz $out/example
-      rm -rf $out/third_party/externals
-      find $out -type l -lname '*nix/store*' -delete
-      find $out -type f -print0 | xargs -0 -r grep -lZ '/nix/store' | xargs -0 -r rm -f || true
-      for hash in "$(basename ${pkgs.bash} | cut -c1-32)" nnm9gdr70ihc6zc9298mzz8jpcgaciql; do
-        find $out -type f -print0 | xargs -0 -r grep -lZ "$hash" | xargs -0 -r rm -f || true
-        find $out -type l -lname "*$hash*" -delete
-      done
-    '';
+  partitionAlloc = pkgs.fetchgit {
+    url = "https://chromium.googlesource.com/chromium/src/base/allocator/partition_allocator.git";
+    rev = "03cc513177b4340bee3dbfd46f6dd5fdded43b79";
+    hash = "sha256-6pP3jvVIDiQbW4053rPwbcNYM/cGkIsuRHkFCSrFzlE=";
   };
+
+  spirvTools = pkgs.fetchgit {
+    url = "https://skia.googlesource.com/external/github.com/KhronosGroup/SPIRV-Tools.git";
+    rev = "911d1eaf87fd7763b2365d7e339816fa31ec3f4b";
+    hash = "sha256-VzxenrzCYwWKKPXOCajAXbRLXzdbUsNyv/1t75HXaDo=";
+  };
+
+  spirvHeaders = pkgs.fetchgit {
+    url = "https://skia.googlesource.com/external/github.com/KhronosGroup/SPIRV-Headers.git";
+    rev = "86f980c731e62ae4eaf383d320449d71687936bf";
+    hash = "sha256-SDfi9eXdnlhhAbT6V4Q5BoM3nkrxkZbiBGmIqWy2Pes=";
+  };
+
+  skiaDeps = skiaSource;
 
   skia = pkgs.stdenv.mkDerivation {
     pname = "raven-skia";
@@ -331,6 +310,13 @@ CLSID_EOF
 
     buildInputs = [ pkgs.freetype ];
 
+    preConfigure = ''
+      mkdir -p third_party/externals
+      ln -s ${partitionAlloc} third_party/externals/partition_alloc
+      ln -s ${spirvTools} third_party/externals/spirv-tools
+      ln -s ${spirvHeaders} third_party/externals/spirv-headers
+    '';
+
     buildPhase = ''
       mkdir -p out
       cat > out/args.gn <<'EOF'
@@ -347,6 +333,7 @@ CLSID_EOF
       skia_use_partition_alloc = false
       skia_use_gl = false
       skia_use_x11 = false
+      skia_use_vulkan = false
       skia_use_fontconfig = false
       skia_use_freetype = true
       skia_use_harfbuzz = false

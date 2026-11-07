@@ -6,7 +6,7 @@
   withGraphics ? true,
   withSqlite ? true,
   withFonts ? true,
-  withSkia ? false,
+  withSkia ? true,
   withTests ? false,
 }:
 
