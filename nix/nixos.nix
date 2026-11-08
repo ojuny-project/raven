@@ -15,13 +15,12 @@ let
   defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.raven;
 
   graphicsLibraries =
-    with config.hardware.graphics;
     if pkgs.stdenv.hostPlatform.is64bit then
-      [ package ] ++ extraPackages
+      [ config.hardware.graphics.package ] ++ config.hardware.graphics.extraPackages
     else
-      [ package32 ] ++ extraPackages32;
+      [ config.hardware.graphics.package32 ] ++ config.hardware.graphics.extraPackages32;
 
-  package = cfg.package.override (previous: {
+  ravenPackage = cfg.package.override (previous: {
     extraLibraries =
       p:
       (if previous ? extraLibraries then previous.extraLibraries p else [ ])
@@ -68,7 +67,7 @@ in
 
   config = lib.mkIf cfg.enable {
     hardware.graphics.enable = lib.mkDefault true;
-    environment.systemPackages = [ package ];
+    environment.systemPackages = [ ravenPackage ];
   };
 
   meta.maintainers = [ ];
