@@ -18,7 +18,7 @@ let
     pkgsCross = pkgs.pkgsCross;
   };
 
-  version = "0-unstable-2026-11-02";
+  version = "0-unstable-2026-11-09";
 
   mingw64 = pkgs.pkgsCross.mingwW64.stdenv.cc;
   mingw32 = pkgs.pkgsCross.mingw32.stdenv.cc;
@@ -33,6 +33,12 @@ let
     "ucrtbase.dll"
     "raven-rtl.dll"
     "raven-storage.dll"
+    "raven-appx.dll"
+    "mspatcha.dll"
+    "vbscript.dll"
+    "scrrun.dll"
+    "wshom.ocx"
+    "jscript.dll"
     "msi.dll"
     "cabinet.dll"
     "sxs.dll"
@@ -74,6 +80,8 @@ let
 
   runtimePrograms = [
     "cmd.exe"
+    "cscript.exe"
+    "wscript.exe"
     "control.exe"
     "dism.exe"
     "fondue.exe"
