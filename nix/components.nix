@@ -42,7 +42,10 @@ let
 
   zlibSource = fetchurl {
     name = "zlib-1.3.1-source.tar.gz";
-    url = "https://zlib.net/fossils/zlib-1.3.1.tar.gz";
+    urls = [
+      "https://zlib.net/fossils/zlib-1.3.1.tar.gz"
+      "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz"
+    ];
     sha256 = "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23";
   };
 
@@ -54,7 +57,10 @@ let
 
   libtiffSource = fetchurl {
     name = "libtiff-4.7.1-source.tar.gz";
-    url = "https://download.osgeo.org/libtiff/tiff-4.7.1.tar.gz";
+    urls = [
+      "https://ftp.osuosl.org/pub/blfs/conglomeration/tiff/tiff-4.7.1.tar.gz"
+      "https://download.osgeo.org/libtiff/tiff-4.7.1.tar.gz"
+    ];
     sha256 = "f698d94f3103da8ca7438d84e0344e453fe0ba3b7486e04c5bf7a9a3fabe9b69";
   };
 
