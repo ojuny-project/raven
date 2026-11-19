@@ -30,6 +30,11 @@ class DeviceInfoSet : public KernelObject {};
 
 // An event log query: the log holds no records, so the query only ever reports that nothing more is there.
 class EventQuery : public KernelObject {};
+// An open color profile: the bytes of the ICC profile, read whole from memory or from a file.
+class ColorProfile : public KernelObject {
+public:
+	std::vector<uint8_t> data;
+};
 
 struct Address {
 	std::vector<uint8_t> socket_address;
@@ -333,6 +338,237 @@ void register_host_api(ApiRegistry &registry, KernelContext &context)
 			}
 		block[node_at] = 1;
 		call.write(call[0], std::span<const uint8_t>(block));
+		call.ret(0);
+	});
+	// Color profiles, as an image decoder opens them to read the header: PROFILE names a file (a bare name lives in the system's color
+	// directory) or a block of memory, and the profile is read once, whole. PROFILEHEADER is the ICC header with each 32-bit field turned
+	// from big-endian to the processor's order.
+	const auto open_profile = [&context, &objects](ApiCall &call, bool wide) {
+		if (!call[0]) {
+			call.fail(87, 0);
+			return;
+		}
+		const uint32_t type = call.load<uint32_t>(call[0]), size = call.load<uint32_t>(call[0] + 2 * call.pointer_width());
+		const uint64_t data = call.load_pointer(call[0] + call.pointer_width());
+		auto profile = std::make_shared<ColorProfile>();
+		if (type == 2 && data && size) {
+			const auto bytes = call.read(data, size);
+			profile->data.assign(bytes.begin(), bytes.end());
+		} else if (type == 1 && data) {
+			auto name = wide ? call.wide(data, 260) : widen_ascii(call.narrow(data, 260));
+			if (name.find_first_of(u"\\/:") == name.npos)
+				name = u"C:\\Windows\\System32\\spool\\drivers\\color\\" + name;
+			const auto resolved = context.paths.resolve(name);
+			std::ifstream file;
+			if (resolved && resolved->exists)
+				file.open(resolved->host, std::ios::binary);
+			if (!file.is_open()) {
+				call.fail(2, 0);
+				return;
+			}
+			profile->data.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+		} else {
+			call.fail(87, 0);
+			return;
+		}
+		const auto made = objects.add_object(profile);
+		if (made.status) {
+			call.fail(8, 0);
+			return;
+		}
+		call.ret(made.value);
+	};
+	registry.add("OpenColorProfileW", 4, [open_profile](ApiCall &call) { open_profile(call, true); });
+	registry.add("OpenColorProfileA", 4, [open_profile](ApiCall &call) { open_profile(call, false); });
+	registry.add("CloseColorProfile", 1, [&objects](ApiCall &call) {
+		if (!objects.object_as<ColorProfile>(call[0])) {
+			call.fail(6, 0);
+			return;
+		}
+		objects.close(call[0]);
+		call.ret(1);
+	});
+	// A profile is valid with a whole header that carries the 'acsp' signature and a size the data holds.
+	const auto profile_valid = [](const ColorProfile &profile) {
+		const auto &data = profile.data;
+		if (data.size() < 128 || data[36] != 'a' || data[37] != 'c' || data[38] != 's' || data[39] != 'p')
+			return false;
+		const uint32_t size = uint32_t(data[0]) << 24 | uint32_t(data[1]) << 16 | uint32_t(data[2]) << 8 | data[3];
+		return size >= 128 && size <= data.size();
+	};
+	registry.add("IsColorProfileValid", 2, [&objects, profile_valid](ApiCall &call) {
+		const auto profile = objects.object_as<ColorProfile>(call[0]);
+		if (!profile || !call[1]) {
+			call.fail(87, 0);
+			return;
+		}
+		call.store<uint32_t>(call[1], profile_valid(*profile) ? 1 : 0);
+		call.ret(1);
+	});
+	registry.add("GetColorProfileHeader", 2, [&objects, profile_valid](ApiCall &call) {
+		const auto profile = objects.object_as<ColorProfile>(call[0]);
+		if (!profile || !call[1] || !profile_valid(*profile)) {
+			call.fail(profile && call[1] ? 2015 : 87, 0);
+			return;
+		}
+		std::vector<uint8_t> header(profile->data.begin(), profile->data.begin() + 128);
+		for (size_t at = 0; at < header.size(); at += 4) {
+			std::swap(header[at], header[at + 3]);
+			std::swap(header[at + 1], header[at + 2]);
+		}
+		call.write(call[1], header);
+		call.ret(1);
+	});
+	// The profile's bytes: the size is the answer to a buffer that is missing or too small, which fails.
+	registry.add("GetColorProfileFromHandle", 3, [&objects](ApiCall &call) {
+		const auto profile = objects.object_as<ColorProfile>(call[0]);
+		if (!profile || !call[2]) {
+			call.fail(87, 0);
+			return;
+		}
+		const uint32_t capacity = call.load<uint32_t>(call[2]);
+		call.store<uint32_t>(call[2], uint32_t(profile->data.size()));
+		if (!call[1] || capacity < profile->data.size()) {
+			call.fail(122, 0);
+			return;
+		}
+		call.write(call[1], profile->data);
+		call.ret(1);
+	});
+	// The elements of a valid profile, from its tag table after the header: a count, then a signature, an offset and a size for each, all
+	// big-endian. An element lies within the profile, or it is not one.
+	struct ProfileElement {
+		uint32_t tag, offset, size;
+	};
+	const auto profile_elements = [profile_valid](const ColorProfile &profile) {
+		std::vector<ProfileElement> elements;
+		const auto &data = profile.data;
+		const auto big = [&data](size_t at) {
+			return uint32_t(data[at]) << 24 | uint32_t(data[at + 1]) << 16 | uint32_t(data[at + 2]) << 8 | data[at + 3];
+		};
+		if (!profile_valid(profile) || data.size() < 132)
+			return elements;
+		const uint32_t count = big(128);
+		for (uint32_t index = 0; index < count && 132 + size_t(index + 1) * 12 <= data.size(); ++index) {
+			const size_t at = 132 + size_t(index) * 12;
+			const ProfileElement element{big(at), big(at + 4), big(at + 8)};
+			if (uint64_t(element.offset) + element.size <= data.size())
+				elements.push_back(element);
+		}
+		return elements;
+	};
+	registry.add("GetCountColorProfileElements", 2, [&objects, profile_valid, profile_elements](ApiCall &call) {
+		const auto profile = objects.object_as<ColorProfile>(call[0]);
+		if (!profile || !call[1] || !profile_valid(*profile)) {
+			call.fail(profile && call[1] ? 2015 : 87, 0);
+			return;
+		}
+		call.store<uint32_t>(call[1], uint32_t(profile_elements(*profile).size()));
+		call.ret(1);
+	});
+	// The tag of an element by its index, which counts from one.
+	registry.add("GetColorProfileElementTag", 3, [&objects, profile_elements](ApiCall &call) {
+		const auto profile = objects.object_as<ColorProfile>(call[0]);
+		if (!profile || !call[2]) {
+			call.fail(87, 0);
+			return;
+		}
+		const auto elements = profile_elements(*profile);
+		const uint32_t index = call.u32(1);
+		if (!index || index > elements.size()) {
+			call.fail(87, 0);
+			return;
+		}
+		call.store<uint32_t>(call[2], elements[index - 1].tag);
+		call.ret(1);
+	});
+	registry.add("IsColorProfileTagPresent", 3, [&objects, profile_elements](ApiCall &call) {
+		const auto profile = objects.object_as<ColorProfile>(call[0]);
+		if (!profile || !call[2]) {
+			call.fail(87, 0);
+			return;
+		}
+		const auto elements = profile_elements(*profile);
+		const uint32_t tag = call.u32(1);
+		call.store<uint32_t>(call[2], std::any_of(elements.begin(), elements.end(), [tag](const auto &element) { return element.tag == tag; }));
+		call.ret(1);
+	});
+	// An element's bytes from an offset into it, as many as the buffer takes. Without a buffer nothing is read: the call fails for want
+	// of room and leaves the element's size, which is how a program sizes the buffer for the call that reads. It is a reference when
+	// another tag names the same bytes.
+	registry.add("GetColorProfileElement", 6, [&objects, profile_elements](ApiCall &call) {
+		const auto profile = objects.object_as<ColorProfile>(call[0]);
+		if (!profile || !call[3]) {
+			call.fail(87, 0);
+			return;
+		}
+		const auto elements = profile_elements(*profile);
+		const uint32_t tag = call.u32(1), offset = call.u32(2);
+		const auto found = std::find_if(elements.begin(), elements.end(), [tag](const auto &element) { return element.tag == tag; });
+		if (found == elements.end()) {
+			call.fail(2302, 0);
+			return;
+		}
+		if (!call[4]) {
+			call.store<uint32_t>(call[3], found->size);
+			call.fail(122, 0);
+			return;
+		}
+		if (offset > found->size) {
+			call.fail(87, 0);
+			return;
+		}
+		const uint32_t count = std::min(call.load<uint32_t>(call[3]), found->size - offset);
+		call.write(call[4], std::span<const uint8_t>(profile->data.data() + found->offset + offset, count));
+		call.store<uint32_t>(call[3], count);
+		if (call[5])
+			call.store<uint32_t>(call[5], std::any_of(elements.begin(), elements.end(), [&](const auto &element) {
+				return element.tag != tag && element.offset == found->offset;
+			}));
+		call.ret(1);
+	});
+	// IP_PER_ADAPTER_INFO: autoconfiguration off, then the resolvers of the host's configuration as IP_ADDR_STRING entries, the first
+	// in the record and the others chained after it; every adapter shares them.
+	registry.add("GetPerAdapterInfo", 3, [](ApiCall &call) {
+		if (!call[2]) {
+			call.ret(error_invalid_parameter);
+			return;
+		}
+		const auto adapters = host_adapters(AF_INET);
+		if (std::none_of(adapters.begin(), adapters.end(), [&](const Adapter &adapter) { return adapter.index == call.u32(0); })) {
+			call.ret(error_no_data);
+			return;
+		}
+		std::vector<std::string> servers;
+		std::ifstream configuration("/etc/resolv.conf");
+		for (std::string line; std::getline(configuration, line);)
+			if (line.starts_with("nameserver ") && line.find(':') == line.npos && line.size() - 11 < 16)
+				servers.push_back(line.substr(11));
+		const size_t width = call.pointer_width();
+		const size_t string_size = (width + 36 + width - 1) & ~(width - 1), list_at = 8 + width, record = list_at + string_size;
+		const size_t needed = record + (servers.size() > 1 ? (servers.size() - 1) * string_size : 0);
+		if (!call[1] || call.load<uint32_t>(call[2]) < needed) {
+			call.store<uint32_t>(call[2], uint32_t(needed));
+			call.ret(error_buffer_overflow);
+			return;
+		}
+		std::vector<uint8_t> block(needed, 0);
+		const uint64_t base = call[1];
+		size_t previous = 0;
+		for (size_t which = 0; which < servers.size(); ++which) {
+			const size_t at = which ? record + (which - 1) * string_size : list_at;
+			std::memcpy(block.data() + at + width, servers[which].data(), servers[which].size());
+			if (which) {
+				const uint64_t next = base + at;
+				std::memcpy(block.data() + previous, &next, width);
+			}
+			previous = at;
+		}
+		if (!servers.empty()) {
+			const uint64_t current = base + list_at;
+			std::memcpy(block.data() + 8, &current, width);
+		}
+		call.write(base, block);
 		call.ret(0);
 	});
 	// The IPv4 adapters in IP_ADAPTER_INFO records, loopback left out; addresses past the first of an adapter are chained after the records.
@@ -899,10 +1135,36 @@ void register_host_api(ApiRegistry &registry, KernelContext &context)
 		}
 		call.ret(made.value);
 	});
+	// Firmware tables: the SMBIOS provider ('RSMB') has one table, a header for SMBIOS 3.0 followed by the end-of-table structure alone,
+	// as on a machine whose firmware describes nothing; the ACPI and raw firmware providers have none.
+	constexpr uint32_t provider_smbios = 0x52534d42;
+	registry.add("EnumSystemFirmwareTables", 3, [](ApiCall &call) {
+		if (call.u32(0) != provider_smbios) {
+			call.ret(0);
+			return;
+		}
+		if (call[1] && call.u32(2) >= 4)
+			call.store<uint32_t>(call[1], 0);
+		call.ret(4);
+	});
+	registry.add("GetSystemFirmwareTable", 4, [](ApiCall &call) {
+		if (call.u32(0) != provider_smbios) {
+			call.fail(1168, 0);
+			return;
+		}
+		const std::vector<uint8_t> table{0, 3, 0, 0, 6, 0, 0, 0, 127, 4, 0xff, 0xff, 0, 0};
+		if (call.u32(3) < table.size() || !call[2]) {
+			call.fail(122, table.size());
+			return;
+		}
+		call.write(call[2], table);
+		call.ret(table.size());
+	});
 	// What the thread's queue holds: the high word the kinds of message waiting, the low word the ones that arrived since the last call.
 	registry.add("GetQueueStatus", 1, [&context](ApiCall &call) {
 		const uint32_t kinds = call.u32(0);
-		if (kinds & ~0x1dffU) { call.fail(87, 0); return; }
+		// QS_EVENT (0x2000) is among the kinds a caller may ask about, though no message here is of that kind.
+		if (kinds & ~0x3dffU) { call.fail(87, 0); return; }
 		const uint32_t status = context.queue_status ? context.queue_status(context.threads.current_id(), kinds, true) : 0;
 		if (!status && context.queue_quiet) context.queue_quiet(context.threads.current_id());
 		call.ret(status);

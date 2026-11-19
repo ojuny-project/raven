@@ -50,23 +50,30 @@ def write_record(path, record):
 
 def runtime_paths(build):
     native = build / "native"
-    files = [native / "raven", native / "raven-bootstrap"]
+    files = [native / "raven", native / "raven-runtime", native / "raven-bootstrap"]
     names = """comctl32.dll raven-user32.dll raven-shell.dll raven-dwrite.dll raven-d2d1.dll
         raven-uianimation.dll ucrtbase.dll raven-rtl.dll raven-storage.dll
         msi.dll cabinet.dll sxs.dll rpcrt4.dll msxml3.dll atl100.dll oleaut32.dll
         libjpeg.dll libtiff.dll propsys.dll mlang.dll windowscodecs.dll gdiplus.dll
-        urlmon.dll riched20.dll msftedit.dll msvfw32.dll advpack.dll mspatcha.dll vbscript.dll scrrun.dll wshom.ocx jscript.dll raven-setupapi.dll xmllite.dll winsqlite3.dll raven-web.dll raven-appx.dll raven-wmi.dll raven-ieframe.dll raven-webengine.dll raven-twinapi.dll
-        icu.dll icuuc.dll icuin.dll
+        urlmon.dll riched20.dll msftedit.dll msvfw32.dll advpack.dll mspatcha.dll vbscript.dll scrrun.dll wshom.ocx jscript.dll raven-setupapi.dll xmllite.dll winsqlite3.dll raven-web.dll raven-appx.dll raven-wmi.dll raven-ieframe.dll raven-webengine.dll raven-twinapi.dll dcomp.dll
+        coremessaging.dll icu.dll icuuc.dll icuin.dll
         cmd.exe control.exe regedit.exe dism.exe fondue.exe msiexec.exe regsvr32.exe
         find.exe findstr.exe more.com sort.exe where.exe xcopy.exe attrib.exe cscript.exe wscript.exe
         timeout.exe choice.exe whoami.exe hostname.exe tasklist.exe taskkill.exe reg.exe rundll32.exe
-        mscoree.dll ucrtbase32.dll l_intl.nls""".split()
+        mscoree.dll ucrtbase32.dll l_intl.nls dsound.dll raven-winmm.dll raven-msacm32.dll""".split()
     for root in (native, native / "x86"):
         files += [root / name for name in names if (root / name).exists()]
-    files += sorted((native / "roots").glob("*.crt"))
     files += sorted((native / "WinMetadata").glob("*.winmd"))
     paths = {path.relative_to(native).as_posix(): path for path in files}
-    font_directory = cache_values(build).get("RAVEN_FONT_DIRECTORY")
+    # Microsoft's code signing roots are not distributed: the runtime downloads them the first time it checks a signature. The 64-bit
+    # Direct3D libraries of DXVK and vkd3d-proton go beside the runtime, where it finds them for 64-bit programs.
+    cache = cache_values(build)
+    for key, names in (("RAVEN_DXVK_PE64_DIR", ("d3d8.dll", "d3d9.dll", "d3d10core.dll", "d3d11.dll", "dxgi.dll")),
+                       ("RAVEN_VKD3D_PE64_DIR", ("d3d12.dll", "d3d12core.dll"))):
+        directory = cache.get(key)
+        if directory and not directory.endswith("-NOTFOUND"):
+            paths.update({name: Path(directory) / name for name in names})
+    font_directory = cache.get("RAVEN_FONT_DIRECTORY")
     if font_directory and not font_directory.endswith("-NOTFOUND"):
         fonts = Path(font_directory)
         for face in ("Sans", "Mono", "Serif"):
@@ -93,11 +100,14 @@ def cache_values(build):
     return values
 
 
+# The configured inputs whose source a release carries: the guest components built from upstream releases, and the Direct3D libraries
+# it ships, vkd3d-proton under the LGPL among them. Skia and libpng linked into the runtime, the fonts and SQLite come under permissive
+# terms whose notices LICENSES/ carries; the code signing roots are not shipped. raven-rtl and the controls are built from this repository's
+# own sources, which the release carries as its source archive.
 def required_materials(cache):
-    keys = [key for key in cache if key.startswith("RAVEN_") and
-            ("COMPONENT_DIR" in key or key.endswith(("_COMPONENT_PATH", "_PE32_DIR", "_PE64_DIR", "_FONT_DIRECTORY", "_SKIA_LIBRARY")))]
-    keys += [key for key, value in cache.items() if key.endswith("_LIBRARY_RELEASE") and value.endswith(".a")]
-    keys += [key for key in ("RAVEN_ROOT_CERTIFICATE_DIRECTORY",) if key in cache]
+    exempt = {"RAVEN_SQLITE_COMPONENT_DIR", "RAVEN_RTL_COMPONENT_PATH", "RAVEN_CONTROLS_COMPONENT_DIR", "RAVEN_CONTROLS32_COMPONENT_DIR"}
+    keys = [key for key in cache if key.startswith("RAVEN_") and key not in exempt and
+            ("COMPONENT_DIR" in key or key.endswith(("_COMPONENT_PATH", "_PE32_DIR", "_PE64_DIR")))]
     return {key for key in keys if cache[key] and not cache[key].endswith("-NOTFOUND")}
 
 
@@ -269,7 +279,7 @@ def main():
             inputs = json.loads(prepared.read_text())
             if inputs != snapshot(source, build):
                 raise RuntimeError("source or configuration changed during the build")
-            if (build / "native/raven").stat().st_mtime < prepared.stat().st_mtime:
+            if (build / "native/raven-runtime").stat().st_mtime < prepared.stat().st_mtime:
                 raise RuntimeError("runtime predates its source record; rebuild first")
             record = dict(inputs=inputs, binaries=runtime_files(build), finished=time.time())
             write_record(build / "native-distribution-build.json", record)

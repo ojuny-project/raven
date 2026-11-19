@@ -1,4 +1,5 @@
 #include "object_api.h"
+#include "event.h"
 #include "threads.h"
 
 #include <array>
@@ -23,6 +24,13 @@ static void put(std::span<uint8_t> bytes, size_t at, uint64_t value, size_t widt
 	for (size_t byte=0; byte<width; ++byte) bytes[at+byte]=uint8_t(value>>(byte*8));
 }
 
+// With a host thread for each guest thread, the threads that waited for the event in the process's table take their turn first.
+static void hand_over_event(NativeObjects &objects, NativeThreads &threads, uint64_t handle)
+{
+	const auto event = objects.object_as<EventObject>(handle);
+	threads.hand_over_to(event ? event->table_object() : 0);
+}
+
 static uint32_t error(uint32_t status)
 {
 	if (status==0xc0000008U) return 6;
@@ -34,7 +42,7 @@ static uint32_t error(uint32_t status)
 	return 87;
 }
 
-void NativeObjectAPI::register_served(ApiRegistry &registry, NativeObjects &objects)
+void NativeObjectAPI::register_served(ApiRegistry &registry, NativeObjects &objects, NativeThreads &threads)
 {
 	registry.add("CloseHandle", 1, [&objects](ApiCall &call) {
 		const uint32_t status=objects.close(call[0]);
@@ -42,18 +50,20 @@ void NativeObjectAPI::register_served(ApiRegistry &registry, NativeObjects &obje
 		else call.ret(1);
 	});
 	for (const bool set : {true, false})
-		registry.add(set ? "SetEvent" : "ResetEvent", 1, [&objects, set](ApiCall &call) {
+		registry.add(set ? "SetEvent" : "ResetEvent", 1, [&objects, &threads, set](ApiCall &call) {
+			if (set && call.process.serving() && !call.process.serving_queued() && threads.others_waiting()) {
+				call.process.decline_served();
+				return;
+			}
 			const uint32_t status=objects.set_event(call[0], set).status;
+			// The thread the event wakes runs before the setter goes on, as it would on another processor.
+			if (set && !status && threads.host_threads())
+				hand_over_event(objects, threads, call[0]);
+			else if (set && !status && !call.process.serving())
+				threads.hand_over();
 			if (status) call.fail(error(status), 0);
 			else call.ret(1);
 		});
-	// PulseEvent: signalled for whoever waits now, and not signalled after.
-	registry.add("PulseEvent", 1, [&objects](ApiCall &call) {
-		uint32_t status=objects.set_event(call[0], true).status;
-		if (!status) status=objects.set_event(call[0], false).status;
-		if (status) call.fail(error(status), 0);
-		else call.ret(1);
-	});
 }
 
 bool NativeObjectAPI::dispatch(std::string_view name)
@@ -106,8 +116,14 @@ bool NativeObjectAPI::dispatch(std::string_view name)
 			status=objects.close(args[0]); result=1;
 		} else if (set) {
 			if (nt && args[1]) writable(args[1],4);
-			const auto changed=objects.set_event(args[0],name=="NtSetEvent" || name=="SetEvent");
+			const bool signal=name=="NtSetEvent" || name=="SetEvent";
+			const auto changed=objects.set_event(args[0],signal);
 			status=changed.status; result=1;
+			// The thread the event wakes runs before the setter goes on, as it would on another processor.
+			if (signal && !status && threads && threads->host_threads())
+				hand_over_event(objects, *threads, args[0]);
+			else if (signal && !status && threads)
+				threads->hand_over();
 			if (nt && args[1] && !status) { std::array<uint8_t,4> output{}; put(output,0,changed.value,4); process.write_memory(args[1],output); }
 		} else if (query) {
 			if (uint32_t(args[1])!=0) status=0xc00000bbU;

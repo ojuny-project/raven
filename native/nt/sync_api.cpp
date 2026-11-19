@@ -1,6 +1,8 @@
 #include "kernel_context.h"
 
 #include <algorithm>
+#include <mutex>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <deque>
@@ -17,6 +19,8 @@ constexpr uint64_t lock_count = 8, recursion_count = 12, owning_thread = 16, spi
 
 struct Waiter {
 	bool woken = false;
+	// The thread that waits, told when the wait ends (NativeThreads::tell).
+	GuestThread *thread = nullptr;
 };
 
 // A keyed event a program created for itself; its keys are apart from those of the process-wide one and of any other.
@@ -80,7 +84,7 @@ void register_sync_api(ApiRegistry &registry, KernelContext &context)
 			threads.block([&context, section] {
 				return context.process.read_memory(section + recursion_count, 4) == std::vector<uint8_t>(4, 0) ||
 					context.process.read_memory(section + owning_thread, 8) == std::vector<uint8_t>(8, 0);
-			}, std::nullopt);
+			}, std::nullopt, false, true);
 		}
 	});
 	registry.add("TryEnterCriticalSection", 1, [take](ApiCall &call) { call.ret(take(call)); });
@@ -102,14 +106,14 @@ void register_sync_api(ApiRegistry &registry, KernelContext &context)
 		const uint64_t lock = call[0];
 		const size_t width = call.pointer_width();
 		while (call.process.compare_exchange(lock, 0, 1, width))
-			threads.block([&context, lock, width] { return context.process.read_memory(lock, width) == std::vector<uint8_t>(width, 0); }, std::nullopt);
+			threads.block([&context, lock, width] { return context.process.read_memory(lock, width) == std::vector<uint8_t>(width, 0); }, std::nullopt, false, true);
 	};
 	const auto acquire_shared = [&context, &threads](ApiCall &call) {
 		const uint64_t lock = call[0];
 		for (;;) {
 			const auto value = call.load_pointer(lock);
 			if (value & 1)
-				threads.block([&context, lock] { return !(context.process.read_memory(lock, 1)[0] & 1); }, std::nullopt);
+				threads.block([&context, lock] { return !(context.process.read_memory(lock, 1)[0] & 1); }, std::nullopt, false, true);
 			else if (call.process.compare_exchange(lock, value, value + 2, call.pointer_width()) == value)
 				return;
 		}
@@ -152,13 +156,14 @@ void register_sync_api(ApiRegistry &registry, KernelContext &context)
 	auto variables = std::make_shared<std::map<uint64_t, std::vector<std::shared_ptr<Waiter>>>>();
 	const auto sleep_on = [&threads, variables](ApiCall &call, std::function<void()> release, std::function<void()> reacquire, uint32_t milliseconds) {
 		auto waiter = std::make_shared<Waiter>();
+		waiter->thread = &threads.current();
 		(*variables)[call[0]].push_back(waiter);
 		call.store_pointer(call[0], (*variables)[call[0]].size());
 		release();
 		std::optional<std::chrono::steady_clock::time_point> wake;
 		if (milliseconds != UINT32_MAX)
 			wake = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
-		threads.block([waiter] { return waiter->woken; }, wake);
+		threads.block([waiter] { return waiter->woken; }, wake, false, false, true);
 		auto &list = (*variables)[call[0]];
 		list.erase(std::remove(list.begin(), list.end(), waiter), list.end());
 		call.store_pointer(call[0], list.size());
@@ -170,9 +175,17 @@ void register_sync_api(ApiRegistry &registry, KernelContext &context)
 		call.ret(1);
 	};
 	registry.add("InitializeConditionVariable", 1, [](ApiCall &call) { call.store_pointer(call[0], 0); });
-	registry.add("SleepConditionVariableSRW", 4, [sleep_on, acquire_exclusive, acquire_shared, release_exclusive, release_shared](ApiCall &call) {
+	registry.add("SleepConditionVariableSRW", 4, [sleep_on, acquire_exclusive, acquire_shared, release_exclusive, release_shared, &context](ApiCall &call) {
 		const bool shared = call.u32(3) & 1;
 		const uint64_t lock = call[1];
+		if (call.pointer_width() == 8 && context.modules.all().contains("raven-rtl.dll")) {
+			// The guest RTL keeps SRW locks, with the mark of a waiter in the word: releasing and taking the lock go through it.
+			const auto release = context.modules.resolve({"kernel32.dll", shared ? "ReleaseSRWLockShared" : "ReleaseSRWLockExclusive", 0, false, 0});
+			const auto acquire = context.modules.resolve({"kernel32.dll", shared ? "AcquireSRWLockShared" : "AcquireSRWLockExclusive", 0, false, 0});
+			const uint64_t arguments[] = {lock};
+			sleep_on(call, [&] { context.call(release, arguments); }, [&] { context.call(acquire, arguments); }, call.u32(2));
+			return;
+		}
 		auto sub = ApiCall(call.process, call.environment, {lock});
 		sleep_on(call, [&] { if (shared) release_shared(sub); else release_exclusive(sub); },
 			[&] { if (shared) acquire_shared(sub); else acquire_exclusive(sub); }, call.u32(2));
@@ -197,18 +210,24 @@ void register_sync_api(ApiRegistry &registry, KernelContext &context)
 			sub.store<int32_t>(section + lock_count, -1);
 		}, [&] {
 			while (!take(sub))
-				threads.block([&context, section] { return context.process.read_memory(section + recursion_count, 4) == std::vector<uint8_t>(4, 0); }, std::nullopt);
+				threads.block([&context, section] { return context.process.read_memory(section + recursion_count, 4) == std::vector<uint8_t>(4, 0); }, std::nullopt, false, true);
 			sub.store<int32_t>(section + recursion_count, saved);
 		}, call.u32(2));
 	});
-	const auto wake = [variables](ApiCall &call, bool all) {
+	const auto wake = [variables, &threads](ApiCall &call, bool all) {
 		auto &list = (*variables)[call[0]];
+		bool woke = false;
 		for (auto &waiter : list)
 			if (!waiter->woken) {
-				waiter->woken = true;
+				waiter->woken = woke = true;
+				threads.tell(*waiter->thread);
 				if (!all)
 					break;
 			}
+		// The thread woken runs before the waker goes on, as it would on another processor: a renderer's worker answers the thread
+		// that waits for its frame without first waiting for every other thread's turn.
+		if (woke && !call.process.serving())
+			threads.hand_over();
 	};
 	registry.add("WakeConditionVariable", 1, [wake](ApiCall &call) { wake(call, false); });
 	registry.add("WakeAllConditionVariable", 1, [wake](ApiCall &call) { wake(call, true); });
@@ -226,7 +245,7 @@ void register_sync_api(ApiRegistry &registry, KernelContext &context)
 		const uint64_t once = call[0];
 		auto state = call.load_pointer(once);
 		if ((state & 3) == 1 && !(flags & 1)) {
-			threads.block([&context, once] { return (context.process.read_memory(once, 1)[0] & 3) != 1; }, std::nullopt);
+			threads.block([&context, once] { return (context.process.read_memory(once, 1)[0] & 3) != 1; }, std::nullopt, false, true);
 			state = call.load_pointer(once);
 		}
 		if ((state & 3) == 2) {
@@ -256,7 +275,7 @@ void register_sync_api(ApiRegistry &registry, KernelContext &context)
 		const uint64_t once = call[0];
 		auto state = call.load_pointer(once);
 		if ((state & 3) == 1) {
-			threads.block([&context, once] { return (context.process.read_memory(once, 1)[0] & 3) != 1; }, std::nullopt);
+			threads.block([&context, once] { return (context.process.read_memory(once, 1)[0] & 3) != 1; }, std::nullopt, false, true);
 			state = call.load_pointer(once);
 		}
 		if ((state & 3) == 2) {
@@ -286,27 +305,87 @@ void register_sync_api(ApiRegistry &registry, KernelContext &context)
 		call.ret(1);
 	});
 
-	// WaitOnAddress watches memory directly; wakeups are implicit because waiting threads re-check the value.
-	registry.add("WaitOnAddress", 4, [&context, &threads](ApiCall &call) {
+	// WaitOnAddress waits until another thread wakes the address, as on Windows: a value that changes without a wake wakes nobody, so
+	// nothing is looked at while the waiter sleeps. A value that differs already when the wait begins returns at once.
+	// A wake may come from a host thread that does not hold the turn (see wake_address_beside), so the waiters have a lock of their own:
+	// a wait compares the value and enters the list under it, and a waker changes the value before it takes the lock, so a wake that
+	// finds nobody came before the comparison, which then sees the new value.
+	struct AddressWaiter {
+		std::atomic<bool> woken{false};
+		GuestThread *thread = nullptr;
+	};
+	struct AddressWaits {
+		std::mutex lock;
+		std::map<uint64_t, std::deque<std::shared_ptr<AddressWaiter>>> waiting;
+	};
+	auto addressed = std::make_shared<AddressWaits>();
+	const auto wait_on = [&context, &threads, addressed](uint64_t address, const std::vector<uint8_t> &expected,
+		std::optional<std::chrono::steady_clock::time_point> wake) {
+		auto waiter = std::make_shared<AddressWaiter>();
+		waiter->thread = &threads.current();
+		{
+			const std::lock_guard guard(addressed->lock);
+			if (context.process.read_memory(address, expected.size()) != expected)
+				return true;
+			addressed->waiting[address].push_back(waiter);
+		}
+		threads.block([waiter] { return waiter->woken.load(std::memory_order_acquire); }, wake, false, false, true);
+		const std::lock_guard guard(addressed->lock);
+		const auto found = addressed->waiting.find(address);
+		if (found != addressed->waiting.end()) {
+			std::erase(found->second, waiter);
+			if (found->second.empty())
+				addressed->waiting.erase(found);
+		}
+		return waiter->woken.load(std::memory_order_acquire);
+	};
+	// Each thread woken is told while the list is held, so it cannot leave its wait and end meanwhile.
+	const auto wake_waiters = [&threads, addressed](uint64_t address, bool all) {
+		const std::lock_guard guard(addressed->lock);
+		const auto found = addressed->waiting.find(address);
+		bool woke = false;
+		if (found != addressed->waiting.end())
+			for (auto &waiter : found->second)
+				if (!waiter->woken.load(std::memory_order_relaxed)) {
+					waiter->woken.store(true, std::memory_order_release);
+					threads.tell(*waiter->thread);
+					woke = true;
+					if (!all)
+						break;
+				}
+		return woke;
+	};
+	context.wake_address_beside = [&threads, wake_waiters](uint64_t address, bool all) {
+		if (!wake_waiters(address, all))
+			return false;
+		threads.signaled();
+		if (threads.waiting_in_runtime())
+			threads.nudge();
+		return true;
+	};
+	registry.add("WaitOnAddress", 4, [wait_on](ApiCall &call) {
 		const size_t size = call[2];
 		if (size != 1 && size != 2 && size != 4 && size != 8) {
 			call.fail(87);
 			return;
 		}
-		const uint64_t address = call[0];
-		const auto expected = call.read(call[1], size);
 		std::optional<std::chrono::steady_clock::time_point> wake;
 		if (call.u32(3) != UINT32_MAX)
 			wake = std::chrono::steady_clock::now() + std::chrono::milliseconds(call.u32(3));
-		const bool changed = threads.block([&context, address, size, expected] { return context.process.read_memory(address, size) != expected; }, wake);
-		if (!changed) {
+		if (!wait_on(call[0], call.read(call[1], size), wake)) {
 			call.fail(1460);
 			return;
 		}
 		call.ret(1);
 	});
-	registry.add("WakeByAddressSingle", 1, [](ApiCall &) {});
-	registry.add("WakeByAddressAll", 1, [](ApiCall &) {});
+	// The thread woken runs before the waker goes on, as for a condition variable.
+	const auto wake_address = [&threads, wake_waiters](ApiCall &call, bool all) {
+		const bool woke = wake_waiters(call[0], all);
+		if (woke && !call.process.serving())
+			threads.hand_over();
+	};
+	registry.add("WakeByAddressSingle", 1, [wake_address](ApiCall &call) { wake_address(call, false); });
+	registry.add("WakeByAddressAll", 1, [wake_address](ApiCall &call) { wake_address(call, true); });
 
 	// An NT timeout: none waits for ever, a negative one is relative and a positive one absolute, both in 100 ns units.
 	const auto nt_timeout = [](ApiCall &call, uint64_t address) -> std::optional<std::chrono::steady_clock::time_point> {
@@ -324,20 +403,16 @@ void register_sync_api(ApiRegistry &registry, KernelContext &context)
 		return std::chrono::steady_clock::now() + delay;
 	};
 	// RtlWaitOnAddress: the ntdll form of WaitOnAddress, answering with an NTSTATUS and taking an NT timeout.
-	registry.add("RtlWaitOnAddress", 4, [&context, &threads, nt_timeout](ApiCall &call) {
+	registry.add("RtlWaitOnAddress", 4, [wait_on, nt_timeout](ApiCall &call) {
 		const size_t size = call[2];
 		if (size != 1 && size != 2 && size != 4 && size != 8) {
 			call.ret(0xc000000d);
 			return;
 		}
-		const uint64_t address = call[0];
-		const auto expected = call.read(call[1], size);
-		const bool changed = threads.block([&context, address, size, expected] { return context.process.read_memory(address, size) != expected; },
-			nt_timeout(call, call[3]));
-		call.ret(changed ? 0 : 0x102);
+		call.ret(wait_on(call[0], call.read(call[1], size), nt_timeout(call, call[3])) ? 0 : 0x102);
 	});
-	registry.add("RtlWakeAddressSingle", 1, [](ApiCall &) {});
-	registry.add("RtlWakeAddressAll", 1, [](ApiCall &) {});
+	registry.add("RtlWakeAddressSingle", 1, [wake_address](ApiCall &call) { wake_address(call, false); });
+	registry.add("RtlWakeAddressAll", 1, [wake_address](ApiCall &call) { wake_address(call, true); });
 
 	// Keyed events: a release meets one wait on the same key, whichever comes first waiting for the other. A null handle names the
 	// process-wide keyed event that critical sections and slim locks use; a key is an address within the event it is used on.

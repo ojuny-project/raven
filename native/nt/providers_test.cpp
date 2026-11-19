@@ -4,6 +4,7 @@
 #include "memory.h"
 #include "threads.h"
 #include "cpu/served_queue.h"
+#include "cpu/served_stub.h"
 
 #include <algorithm>
 #include <array>
@@ -17,6 +18,9 @@
 #include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
+
+static const size_t served_trap = raven::served_stub::trap(), served_wait = raven::served_stub::wait(),
+	served_yield = raven::served_stub::yield();
 
 static void check(bool condition, const char *message)
 {
@@ -56,8 +60,16 @@ static void apc_wait_result(const std::string &bootstrap)
 	threads.current().apcs.clear();
 }
 
+// The time slice of a serial guest, which switches threads within its one task: the guest is serial whatever the environment asks,
+// and the environment is as it was afterwards (--parallel-served covers a guest with a task for each thread).
 static void served_thread_result(const std::string &bootstrap)
 {
+	struct Serial {
+		const char *const parallel = std::getenv("RAVEN_PARALLEL");
+		const std::string kept = parallel ? parallel : "";
+		Serial() { ::unsetenv("RAVEN_PARALLEL"); }
+		~Serial() { if (parallel) ::setenv("RAVEN_PARALLEL", kept.c_str(), 1); }
+	} serial;
 	const auto timeout = std::chrono::seconds(2);
 	const uint64_t base = 0x180000000ULL;
 	const std::array<std::string_view, 1> names{"vkCmdDrawIndexed"};
@@ -85,7 +97,7 @@ static void served_thread_result(const std::string &bootstrap)
 	const auto other = process.new_thread(other_stack + 65536, other_teb);
 	unsigned calls = 0, switches = 0;
 	bool nested = false;
-	process.set_served_calls(block, {stub}, 112, 85, {stub + 109}, [&](uint64_t address) {
+	process.set_served_calls(block, {stub}, served_trap, served_wait, {stub + served_yield}, [&](uint64_t address) {
 		check(address == stub, "served call used another stub");
 		check(process.serving_teb() == (nested ? other_teb : teb), "served call lost its current TEB");
 		const auto words = process.api_arguments(6);
@@ -99,7 +111,7 @@ static void served_thread_result(const std::string &bootstrap)
 		process.return_api(sum);
 	});
 	process.set_time_slicing(std::chrono::milliseconds(1), [&] { return !nested; }, [&] {
-		check(process.context().registers.rip == stub + 110, "served thread yielded before its result was private");
+		check(process.context().registers.rip == stub + served_yield + 1, "served thread yielded before its result was private");
 		const auto saved = process.save_thread();
 		nested = true;
 		process.load_thread(other);
@@ -147,7 +159,7 @@ static void parallel_served_result(const std::string &bootstrap)
 	raven::NativeThreadState other;
 	bool nested = false;
 	unsigned calls = 0;
-	process.set_served_calls(nullptr, {stub}, 112, 85, {}, [&](uint64_t address) {
+	process.set_served_calls(nullptr, {stub}, served_trap, served_wait, {}, [&](uint64_t address) {
 		check(address == stub, "parallel call used another stub");
 		check(process.serving_teb() == (nested ? other.context.registers.gs_base : teb), "served call lost its host-recorded TEB");
 		const auto words = process.api_arguments(6);
@@ -229,9 +241,9 @@ static void parallel_served_result(const std::string &bootstrap)
 	check(calls == 128, "parallel served call was lost or repeated");
 	process.stop_thread(other);
 	// A responsive served loop must give ready host work a turn even when its guest never reaches the wait trap.
-	loaded.data()[stub - base + 85] = 0x90;
+	loaded.data()[stub - base + served_wait] = 0x90;
 	unsigned turns = 0;
-	process.set_served_calls(nullptr, {stub}, 112, 85, {}, [&](uint64_t) {
+	process.set_served_calls(nullptr, {stub}, served_trap, served_wait, {}, [&](uint64_t) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(2));
 		process.return_api(615);
 	});
@@ -263,7 +275,7 @@ static void queued_served_result(const std::string &bootstrap, const std::string
 	auto &colour_provider = modules.add("opengl32.dll", raven::runtime_provider("opengl32.dll", colour_base, colour_names, false, {}, {}, true));
 	const auto colour_rva = colour_provider.exports.at(0).address;
 	colour_entry = colour_base + colour_rva;
-	colour_stub = raven::api_trap_address(colour_provider, "opengl32.dll", "glColor4f", colour_rva) - 112;
+	colour_stub = raven::api_trap_address(colour_provider, "opengl32.dll", "glColor4f", colour_rva) - served_trap;
 	check(colour_entry != colour_stub, "queued colour test is missing its queue prelude");
 	const std::array<uint8_t, 12> colour_local{0x65, 0x4c, 0x8b, 0x14, 0x25, 0xf0, 0x1f, 0, 0, 0x90, 0x90, 0x90};
 	std::copy(colour_local.begin(), colour_local.end(), colour_provider.loaded.data().data() + colour_stub - colour_base);
@@ -275,7 +287,7 @@ static void queued_served_result(const std::string &bootstrap, const std::string
 	for (size_t index = 0; index < names.size(); ++index) {
 		const uint32_t rva = provider.exports.at(provider.export_names.at(std::string(names[index]))).address;
 		entries[index] = base + rva;
-		stubs[index] = raven::api_trap_address(provider, "vulkan-1.dll", names[index], rva) - 112;
+		stubs[index] = raven::api_trap_address(provider, "vulkan-1.dll", names[index], rva) - served_trap;
 		const std::array<uint8_t, 12> local{0x65, 0x4c, 0x8b, 0x14, 0x25, 0xf0, 0x1f, 0, 0, 0x90, 0x90, 0x90};
 		std::copy(local.begin(), local.end(), provider.loaded.data().data() + stubs[index] - base);
 	}
@@ -301,7 +313,7 @@ static void queued_served_result(const std::string &bootstrap, const std::string
 	const uint64_t entry = program.loaded.base() + program.image.entry;
 	std::vector<uint64_t> served{stubs.begin(), stubs.end()}, queued{stubs[0], stubs[1], stubs[3], stubs[4]};
 	if (colour_stub) { served.push_back(colour_stub); queued.push_back(colour_stub); }
-	process.set_served_calls(nullptr, served, 112, 85, {}, [&](uint64_t stub) {
+	process.set_served_calls(nullptr, served, served_trap, served_wait, {}, [&](uint64_t stub) {
 		if (stub == colour_stub) {
 			const auto producer = process.serving_teb();
 			check(producer == teb || producer == other.context.registers.gs_base, "queued colour lost its producer");
@@ -496,8 +508,8 @@ int main(int argc, char **argv)
 			raven::ModuleSet semaphores;
 			auto &semaphore = semaphores.add(name, raven::runtime_provider(name, 0x180000000ULL, semaphore_names));
 			const auto rva = semaphore.exports.at(0).address;
-			check(raven::api_trap_address(semaphore, name, "ReleaseSemaphore", rva) == semaphore.loaded.base() + rva + 112 &&
-				semaphore.loaded.data()[rva + 112] == 0xcc, "semaphore release does not use a served stub");
+			check(raven::api_trap_address(semaphore, name, "ReleaseSemaphore", rva) == semaphore.loaded.base() + rva + served_trap &&
+				semaphore.loaded.data()[rva + served_trap] == 0xcc, "semaphore release does not use a served stub");
 			raven::ModuleSet clocks;
 			const std::array<std::string_view, 3> names{"QueryPerformanceCounter", "QueryPerformanceFrequency", "VirtualAlloc"};
 			auto &provider = clocks.add(name, raven::runtime_provider(name, 0x180000000ULL, names, false, {}, {}, true));
@@ -553,6 +565,21 @@ int main(int argc, char **argv)
 		check(std::ranges::equal(service, smaller_image.file_span(smaller_image.exports()[0].address, 11)),
 			"NT service identity depends on the process import graph");
 		check(nt_image.file_span(nt_exports[2].address, 1)[0] == 0xcc, "unknown NT function received a service identity");
+		// A provider is made once at a base of its own and moved where its size fits: what it is moved to must be the provider made there.
+		for (const auto library : {"kernel32.dll", "user32.dll", "gdi32.dll", "ntdll.dll", "uxtheme.dll", "ole32.dll"}) {
+			const auto listed = raven::system_export_names(library);
+			std::vector<std::string_view> names(listed.begin(), listed.end());
+			std::sort(names.begin(), names.end());
+			names.erase(std::unique(names.begin(), names.end()), names.end());
+			check(!names.empty(), "a library to move has no published exports");
+			const auto ordinals = raven::system_export_ordinals(library);
+			for (const bool fast : {false, true}) {
+				const auto made = raven::runtime_provider(library, 0x7ff812340000ULL, names, false, {}, ordinals, fast);
+				check(raven::moved_provider(raven::runtime_provider(library, base, names, false, {}, ordinals, fast), 0x7ff812340000ULL) == made,
+					"a moved provider differs from the one made at its base");
+			}
+		}
+		rejected([&] { raven::moved_provider(raven::runtime_provider("gdi32.dll", 0x50000000, raven::system_export_names("gdi32.dll"), true), base); });
 		std::vector<std::string> storage;
 		for (size_t index = 0; index < 128; ++index)
 			storage.push_back("A" + std::string(3 - std::to_string(index).size(), '0') + std::to_string(index));

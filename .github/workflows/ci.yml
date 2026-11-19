@@ -5,6 +5,11 @@ on:
     branches: ["main"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      parallel:
+        description: Run every test with a host thread for each guest thread (RAVEN_PARALLEL=1)
+        type: boolean
+        default: false
   workflow_call:
 
 permissions:
@@ -20,8 +25,8 @@ env:
   COMPONENTS: /opt/ci/components
   BUILD: /opt/ci/build
   ARCHIVES: /opt/ci/archives
-  EUPROVGUARD_VERSION: "v1.2.1"
-  GO_VERSION: "1.25.13"
+  EUPROVGUARD_VERSION: "v1.3.0"
+  EUPROVGUARD_SHA256: "a054edeae1d9b8cac0bfd2cdb43562c606a8292e9c4c72fe54667b972e6f23d5"
 
 jobs:
   # Policy: cheap checks of what is being proposed, before any runner time is spent compiling it.
@@ -82,6 +87,9 @@ jobs:
       - name: Compile Python tools
         run: python3 -m py_compile scripts/*.py .github/scripts/*.py
 
+      - name: Test the downloads of pinned files
+        run: python3 scripts/test_downloads.py
+
       - name: Parse shell tools
         shell: bash
         run: |
@@ -91,6 +99,86 @@ jobs:
             bash -n "${script}"
           done
           echo "${#shells[@]} shell scripts parsed"
+
+  # The waits on kernel objects: native/model/Waits.tla, Address.tla, Completion.tla and Messages.tla checked by TLC, and the implementation in native/waits by its tests and by loom,
+  # which tries every interleaving of its cases. The PE reader in native/peparse runs its tests too, which change a file at random and read it again,
+  # and the cabinet decoders, the image decoders, the compound file reader, the XML reader and the delta patch reader
+  # are fed changed input under the sanitizers.
+  models:
+    name: Models
+    needs: [commits, files, licenses, scripts]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    container:
+      image: fedora:45@sha256:a7d72ba2745b100a3351087472e5ee7b2450af7cf331e7673007e3817612839c
+    env:
+      TLA_TOOLS_URL: https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+      TLA_TOOLS_SHA256: 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+    steps:
+      - name: Install packages
+        run: dnf install -y --setopt=install_weak_deps=False git cargo rust gcc libasan libubsan python3 java-latest-openjdk-headless
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the model
+        run: |
+          curl -fsSL -o /tmp/tla2tools.jar "${TLA_TOOLS_URL}"
+          echo "${TLA_TOOLS_SHA256}  /tmp/tla2tools.jar" | sha256sum -c -
+          cd native/model
+          for config in MCWaits.cfg MCWaitsThree.cfg; do
+            java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -metadir /tmp/tlc -config "${config}" MCWaits.tla
+          done
+          for config in MCAddressSections.cfg MCAddressSrw.cfg; do
+            java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -metadir /tmp/tlc -config "${config}" MCAddress.tla
+          done
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -metadir /tmp/tlc -config MCCompletion.cfg MCCompletion.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -metadir /tmp/tlc -config MCMessages.cfg MCMessages.tla
+
+      - name: Test the implementation
+        working-directory: native/waits
+        run: cargo test --locked --release
+
+      - name: Check every interleaving
+        working-directory: native/waits
+        env:
+          RUSTFLAGS: --cfg loom
+          CARGO_TARGET_DIR: target-loom
+        run: cargo test --locked --release --test loom
+
+      - name: Test the PE reader
+        working-directory: native/peparse
+        run: cargo test --locked --release
+
+      - name: Change the cabinet decoders at random
+        run: |
+          gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -Inative/guest/raven-cabinet -o /tmp/cabinet-decoders \
+            native/fuzz/cabinet_decoders.c native/guest/raven-cabinet/lzx.c native/guest/raven-cabinet/quantum.c
+          /tmp/cabinet-decoders 40000
+
+      - name: Change the image decoders at random
+        run: python3 native/fuzz/image_decoders.py --rounds 40000
+
+      - name: Change compound files at random
+        run: |
+          gcc -O1 -g -fshort-wchar -fsanitize=address,undefined -fno-sanitize-recover=all -Inative/fuzz/storage -Inative/guest/raven-storage \
+            -o /tmp/storage-container native/fuzz/storage_container.c native/guest/raven-storage/container.c
+          /tmp/storage-container 40000
+
+      - name: Change XML documents at random
+        run: |
+          gcc -O1 -g -fshort-wchar -fsanitize=address,undefined -fno-sanitize-recover=all -Inative/fuzz/xml -Inative/guest/raven-xmllite \
+            -o /tmp/xml-reader native/fuzz/xml_reader.c native/guest/raven-xmllite/reader.c
+          /tmp/xml-reader 200000
+
+      - name: Change delta patches at random
+        run: |
+          python3 testdata/native_loader/mspatcha_fixtures.py /tmp/patches
+          gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -Inative/guest/raven-mspatcha -o /tmp/patch-apply \
+            native/fuzz/patch_apply.c native/guest/raven-mspatcha/pa19.c native/guest/raven-mspatcha/lzxd.c
+          /tmp/patch-apply /tmp/patches 40000
 
   # Provision: the pinned external inputs, each in its own job because they share nothing and some take long. A component is
   # rebuilt only when its recipe or its sources change.
@@ -122,10 +210,12 @@ jobs:
             arguments: --arch x64 --output
             recipe: scripts/provision-installer.py
             sources: native/guest/**
+            materials: true
           - component: installer32
             arguments: --arch x86 --output
             recipe: scripts/provision-installer.py
             sources: native/guest/**
+            materials: true
           - component: sqlite
             arguments: --output
             recipe: scripts/provision-sqlite.py
@@ -133,6 +223,7 @@ jobs:
             arguments: --destination
             recipe: scripts/provision-graphics.py
             sources: native/graphics/backends.json
+            materials: true
           - component: roots
             arguments: --output
             recipe: scripts/provision-roots.py
@@ -170,7 +261,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.TARGET }}
-          key: component-${{ matrix.component }}-${{ hashFiles(matrix.recipe, matrix.sources || matrix.recipe) }}
+          key: component-${{ matrix.component }}-${{ matrix.materials && 'materials-' || '' }}${{ hashFiles(matrix.recipe, matrix.sources || matrix.recipe) }}
 
       - name: Provision ${{ matrix.component }}
         if: steps.cache.outputs.cache-hit != 'true'
@@ -192,14 +283,19 @@ jobs:
           find . -mindepth 1 -maxdepth 1 ! -name include ! -name src ! -name modules ! -name LICENSE -exec rm -rf {} +
           find "${TARGET}/cpu-fonts" -mindepth 1 ! -name libskia.a -exec rm -rf {} +
 
-      # The upstream source archives and their extracted trees are the corresponding source of a release, which provisions its own; tests only
-      # load the built components.
+      # Tests only load the built components. The upstream source archives of those a release ships with their source stay, as the
+      # nightly bundles this very build with them (see release_materials.py); the trees extracted from them go.
       - name: Trim the upstream sources
         if: steps.cache.outputs.cache-hit != 'true'
         shell: bash
+        env:
+          MATERIALS: ${{ matrix.materials && 'keep' || '' }}
         run: |
           set -euo pipefail
-          rm -rf "${TARGET}"/*-source.tar.* "${TARGET}"/*-source
+          rm -rf "${TARGET}"/*-source
+          if [ -z "${MATERIALS}" ]; then
+            rm -rf "${TARGET}"/*-source.tar.*
+          fi
 
       # Artifacts drop file modes, so the component travels as an archive.
       - name: Pack component
@@ -229,14 +325,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: false
-
+      # The release binary, checked against the digest pinned above.
       - name: Install EUProvGuard
-        run: go install "github.com/fabricatorsltd/euprovguard@${EUPROVGUARD_VERSION}"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bin"
+          curl -fsSL -o "${RUNNER_TEMP}/bin/euprovguard" \
+            "https://github.com/fabricatorsltd/euprovguard/releases/download/${EUPROVGUARD_VERSION}/euprovguard-linux-amd64"
+          echo "${EUPROVGUARD_SHA256}  ${RUNNER_TEMP}/bin/euprovguard" | sha256sum -c -
+          chmod +x "${RUNNER_TEMP}/bin/euprovguard"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
 
       - name: Scan the tree
         shell: bash
@@ -248,10 +347,9 @@ jobs:
             -name raven \
             -version-tag "0.0.0-${GITHUB_SHA:0:7}" \
             -output compliance/sbom.json \
-            -bundle compliance/report 2>&1 | tee compliance/scan.log
-
-      - name: Gate the findings
-        run: python3 .github/scripts/check_compliance.py compliance/sbom.json compliance/scan.log
+            -bundle compliance/report \
+            -baseline .github/compliance/accepted.json \
+            -fail-on-findings 2>&1 | tee compliance/scan.log
 
       - name: Upload compliance artifacts
         if: always()
@@ -264,9 +362,103 @@ jobs:
   # Build: one Release tree with every provisioned component configured, so the tests below exercise the same inputs a
   # release is made from.
 
+  # The host binaries a release ships, raven and raven-runtime, are built on the oldest glibc a release supports (2.34: Ubuntu 22.04,
+  # Debian 12, RHEL 9), with the static libraries they link built there too; the build job takes them in place of its own before it
+  # records the build, so the tests run the very binaries a release ships. The guest libraries are Windows code and need no such care.
+  portable:
+    name: Portable host
+    needs: [commits, files, licenses, scripts]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    container:
+      image: quay.io/pypa/manylinux_2_34_x86_64@sha256:eaf34dc7cfdff5db7109a92c87b4f797b8bbd1f9ed8da48c02c4025b6ea76650
+    env:
+      CCACHE_DIR: /opt/ci/ccache
+      CCACHE_MAXSIZE: 1G
+    steps:
+      - name: Install packages
+        run: |
+          dnf install -y --setopt=install_weak_deps=False dnf-plugins-core
+          dnf config-manager --set-enabled crb
+          dnf install -y --setopt=install_weak_deps=False git python3 python3-fonttools cmake make ccache clang llvm lld bison patch \
+            tar xz zstd cargo rust wayland-devel wayland-protocols-devel libxkbcommon-devel libxkbcommon-x11-devel libxcb-devel \
+            pixman-devel freetype-devel mesa-libEGL-devel mesa-libGL-devel mesa-libGLU-devel vulkan-loader-devel vulkan-headers \
+            openssl-devel zlib-devel binutils perl-IPC-Cmd perl-FindBin perl-Time-Piece perl-File-Compare perl-File-Copy
+          dnf clean all
+          git config --global --add safe.directory "*"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore linked components
+        id: cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /opt/ci/components/text
+            /opt/ci/components/libpng
+            /opt/ci/components/openssl
+            /opt/ci/components/mingw32
+          key: portable-components-${{ hashFiles('scripts/provision-text.py', 'scripts/provision-libpng.py', 'scripts/provision-openssl.py',
+            'scripts/provision-mingw32-layout.py') }}
+
+      - name: Provision linked components
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/provision-libpng.py --output "${COMPONENTS}/libpng"
+          python3 scripts/provision-openssl.py --jobs 4 --output "${COMPONENTS}/openssl"
+          python3 scripts/provision-mingw32-layout.py --output "${COMPONENTS}/mingw32"
+          python3 scripts/provision-text.py --jobs 4 --output "${COMPONENTS}/text"
+          cd "${COMPONENTS}/text/skia"
+          find . -mindepth 1 -maxdepth 1 ! -name include ! -name src ! -name modules ! -name LICENSE -exec rm -rf {} +
+          find "${COMPONENTS}/text/cpu-fonts" -mindepth 1 ! -name libskia.a -exec rm -rf {} +
+
+      - name: Restore compiler cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /opt/ci/ccache
+          key: portable-ccache-${{ github.sha }}
+          restore-keys: portable-ccache-
+
+      # The same options as the build job, so the binaries are configured as the ones they stand in for, with OpenSSL linked in
+      # (distributions name its libraries by major version) and 32-bit Vulkan layouts taken from clang, as no MinGW is packaged here.
+      - name: Configure
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t options < <(.github/scripts/components.sh options)
+          cmake -S . -B "${BUILD}" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache "${options[@]}" \
+            -DOPENSSL_USE_STATIC_LIBS=TRUE -DOPENSSL_ROOT_DIR="${COMPONENTS}/openssl/install" \
+            -DRAVEN_MINGW32_VULKAN="${COMPONENTS}/mingw32/bin/i686-w64-mingw32-gcc"
+
+      - name: Build
+        # Every file that does not build is listed in one run: the older libraries here are where these binaries break first.
+        run: cmake --build "${BUILD}" -j "$(nproc)" --target raven raven-runtime -- -k
+
+      - name: Check portability
+        run: python3 .github/scripts/check_portable.py 2.34 "${BUILD}/native/raven" "${BUILD}/native/raven-runtime"
+
+      - name: Pack host binaries
+        run: |
+          tar -C "${BUILD}/native" -cf /opt/ci/portable.tar --transform 's/^host-features.txt$/portable-features.txt/' raven raven-runtime \
+            host-features.txt
+
+      - name: Upload host binaries
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: portable-host
+          path: /opt/ci/portable.tar
+          retention-days: 3
+          if-no-files-found: error
+
   build:
     name: Build
-    needs: provision
+    needs: [provision, portable]
     runs-on: ubuntu-26.04
     timeout-minutes: 180
     container:
@@ -313,8 +505,28 @@ jobs:
           cmake -S . -B "${BUILD}" -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache "${options[@]}"
 
+      # The build is recorded as docs/packaging.md asks, so the nightly can bundle this very tree once the shards passed on it.
+      - name: Prepare
+        run: python3 scripts/package-native.py prepare --source "${GITHUB_WORKSPACE}" --build "${BUILD}"
+
       - name: Build
         run: cmake --build "${BUILD}" -j "$(nproc)"
+
+      - name: Download portable host binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: portable-host
+          path: /opt/ci/portable
+
+      # The tests run, and a release ships, the host binaries built on the oldest supported glibc, with every feature built here.
+      - name: Take the portable host binaries
+        run: |
+          tar -C "${BUILD}/native" -m -xf /opt/ci/portable/portable.tar
+          diff -u "${BUILD}/native/host-features.txt" "${BUILD}/native/portable-features.txt"
+          python3 .github/scripts/check_portable.py 2.34 "${BUILD}/native/raven" "${BUILD}/native/raven-runtime"
+
+      - name: Seal
+        run: python3 scripts/package-native.py seal --source "${GITHUB_WORKSPACE}" --build "${BUILD}"
 
       - name: Compiler cache statistics
         run: ccache --show-stats
@@ -354,6 +566,7 @@ jobs:
     env:
       SHARD: ${{ matrix.shard }}
       XDG_RUNTIME_DIR: /run/ci-runtime
+      PARALLEL: ${{ inputs.parallel && 'yes' || '' }}
     steps:
       - name: Install packages
         run: |
@@ -389,10 +602,12 @@ jobs:
           zstd -d -q -c /opt/ci/build.tar.zst | tar -C /opt/ci -xf -
           install -d -m 0700 "${XDG_RUNTIME_DIR}"
 
+      # The runtime turns parallel mode on when RAVEN_PARALLEL is set at all, so it is only exported when asked for.
       - name: Run shard ${{ matrix.shard }}
-        run: >
-          ctest --test-dir "${BUILD}" -I "${SHARD},,6" -j 2 --timeout 1200
-          --output-on-failure --output-junit "${BUILD}/junit-${SHARD}.xml"
+        run: |
+          if [ -n "${PARALLEL}" ]; then export RAVEN_PARALLEL=1; fi
+          ctest --test-dir "${BUILD}" -I "${SHARD},,6" -j 2 --timeout 1200 \
+            --output-on-failure --output-junit "${BUILD}/junit-${SHARD}.xml"
 
       - name: Upload results
         if: always()
@@ -409,7 +624,7 @@ jobs:
 
   report:
     name: Report
-    needs: [commits, files, licenses, scripts, provision, compliance, build, test]
+    needs: [commits, files, licenses, scripts, models, provision, portable, compliance, build, test]
     if: always()
     runs-on: ubuntu-26.04
     timeout-minutes: 5

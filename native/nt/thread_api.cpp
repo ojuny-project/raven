@@ -1,15 +1,19 @@
+#include "unwind.h"
 #include "child_process.h"
 #include "kernel_context.h"
 #include "mutex.h"
 #include "event.h"
+#include "kernel_waits.h"
 #include "security_attributes.h"
 #include "shared_file.h"
 #include "text.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <map>
 #include <mutex>
+#include <thread>
 
 namespace raven {
 
@@ -50,12 +54,27 @@ struct SemaphoreState {
 	int32_t maximum = 0;
 };
 
+// A semaphore without a name lives in the process's table (kernel_waits.h); a named one in the memory the processes share.
 class SemaphoreObject : public KernelObject {
 public:
-	std::u16string_view type_name() const override { return u"Semaphore"; }
-	int signaled(uint32_t) const override { return state->count.load() > 0; }
-	bool try_consume(uint32_t) override
+	~SemaphoreObject() override
 	{
+		if (waits_object)
+			raven_waits_close(kernel_waits(), waits_object);
+	}
+	std::u16string_view type_name() const override { return u"Semaphore"; }
+	uint32_t table_semaphore() const override { return waits_object; }
+	int signaled(uint32_t) const override
+	{
+		uint32_t count = 0;
+		if (waits_object)
+			return raven_waits_query(kernel_waits(), waits_object, &count) == 0 && count > 0;
+		return state->count.load() > 0;
+	}
+	bool try_consume(uint32_t thread) override
+	{
+		if (waits_object)
+			return raven_waits_wait(kernel_waits(), thread, &waits_object, 1, 0, 0, 0) == 0;
 		auto current = state->count.load();
 		while (current > 0)
 			if (state->count.compare_exchange_weak(current, current - 1))
@@ -63,9 +82,11 @@ public:
 		return false;
 	}
 	void consume(uint32_t thread) override { try_consume(thread); }
+	std::atomic<uint32_t> *wait_word() const override { return shared ? reinterpret_cast<std::atomic<uint32_t> *>(&state->count) : nullptr; }
 	SemaphoreState local;
 	SemaphoreState *state = &local;
 	std::shared_ptr<SharedFile> shared;
+	uint32_t waits_object = 0;
 };
 
 // A named event: its state is shared memory, so a program in another process of the prefix sees it set.
@@ -124,10 +145,13 @@ public:
 	int set_state(bool value) override
 	{
 		const int previous = int(state->signaled.exchange(value ? 1 : 0));
-		if (value)
+		if (value) {
+			wake_word(&state->signaled);
 			announce_shared_change();
+		}
 		return previous;
 	}
+	std::atomic<uint32_t> *wait_word() const override { return &state->signaled; }
 	EventState *state = nullptr;
 	std::shared_ptr<SharedFile> shared;
 };
@@ -142,13 +166,17 @@ public:
 	std::shared_ptr<GuestThread> running;
 };
 
-// A timer of a timer queue: its callback runs on a guest thread when it is due, and again every period until it is deleted.
+// A timer of a timer queue: its callback runs on a guest thread when it is due, and again every period until it is deleted. A thread
+// pool timer is one too; it has a callback instance, starts unset, and its callback takes the instance, the context and the timer.
 class QueueTimer : public KernelObject {
 public:
-	uint64_t handle = 0, callback = 0, parameter = 0;
+	uint64_t handle = 0, callback = 0, parameter = 0, instance = 0;
 	uint32_t period = 0, flags = 0;
+	// A multimedia timer of winmm.dll: its number, which its callback receives first; with TIME_CALLBACK_EVENT_SET or _PULSE the
+	// callback is an event the timer sets or pulses.
+	uint32_t multimedia = 0;
 	std::chrono::steady_clock::time_point deadline;
-	bool active = true;
+	bool active = true, closed = false;
 	std::shared_ptr<GuestThread> running;
 };
 
@@ -161,6 +189,9 @@ class WorkObject : public KernelObject {
 public:
 	uint64_t callback = 0, parameter = 0;
 	std::vector<std::shared_ptr<GuestThread>> running;
+	// The guest RTL's thread_pool_work for this item once the pool's workers run it: callback, context, handle and the submissions not
+	// yet finished.
+	uint64_t block = 0;
 };
 
 // A private pool only bounds its threads; work items run on guest threads whichever pool they name.
@@ -177,6 +208,22 @@ public:
 
 }
 
+bool run_user_apcs(KernelContext &context)
+{
+	auto &me = context.threads.current();
+	bool ran = false;
+	while (!me.apcs.empty()) {
+		const auto apc = me.apcs.front();
+		me.apcs.pop_front();
+		const auto arguments = apc.arguments.empty() ? std::vector<uint64_t>{apc.parameter} : apc.arguments;
+		const auto result = context.call(apc.routine, arguments);
+		if (result.stop != NativeStop::returned)
+			throw result;
+		ran = true;
+	}
+	return ran;
+}
+
 void register_thread_api(ApiRegistry &registry, KernelContext &context)
 {
 	auto &threads = context.threads;
@@ -190,22 +237,26 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 		return object ? object->thread : nullptr;
 	};
 
-	const auto run_apcs = [&context, &threads]() {
-		auto &me = threads.current();
-		bool ran = false;
-		while (!me.apcs.empty()) {
-			const auto apc = me.apcs.front();
-			me.apcs.pop_front();
-			const auto arguments = apc.arguments.empty() ? std::vector<uint64_t>{apc.parameter} : apc.arguments;
-			const auto result = context.call(apc.routine, arguments);
-			if (result.stop != NativeStop::returned)
-				throw result;
-			ran = true;
+	const auto run_apcs = [&context]() { return run_user_apcs(context); };
+	// The objects of the process's table the handles stand for, in their order; empty when one of them is not in the table.
+	const auto table_objects = [](NativeObjects &objects, const std::vector<uint64_t> &handles) {
+		std::vector<uint32_t> table;
+		for (const auto handle : handles) {
+			uint32_t object = 0;
+			if (const auto event = objects.object_as<EventObject>(handle))
+				object = event->table_object();
+			else if (const auto mutex = objects.object_as<MutexObject>(handle))
+				object = mutex->table_object();
+			else if (const auto semaphore = objects.object_as<SemaphoreObject>(handle))
+				object = semaphore->waits_object;
+			if (!object)
+				return std::vector<uint32_t>{};
+			table.push_back(object);
 		}
-		return ran;
+		return table;
 	};
 	// Waits for any or all of the handles; returns the Windows wait code.
-	const auto wait = [&objects, &threads, run_apcs](ApiCall &call, const std::vector<uint64_t> &handles, bool all, uint32_t milliseconds, bool alertable) -> uint32_t {
+	const auto wait = [&objects, &threads, run_apcs, table_objects](ApiCall &call, const std::vector<uint64_t> &handles, bool all, uint32_t milliseconds, bool alertable) -> uint32_t {
 		const uint32_t id = threads.current_id();
 		const auto *me = &threads.current();
 		if (handles.empty() || handles.size() > 64) {
@@ -218,10 +269,11 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 				call.set_last_error(6);
 				return wait_failed;
 			}
+		WaitedObjects waited(objects, resolved);
 		const auto states = [&]() {
 			std::vector<int> result;
-			for (const auto handle : resolved)
-				result.push_back(objects.signaled(handle, id));
+			for (size_t index = 0; index < resolved.size(); ++index)
+				result.push_back(waited.signaled(index, id));
 			return result;
 		};
 		std::optional<std::chrono::steady_clock::time_point> wake;
@@ -235,24 +287,62 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 				std::any_of(now.begin(), now.end(), [](int state) { return state == 1; });
 		};
 		bool looked = false;
-		for (;;) {
-			const auto current = states();
-			for (const auto state : current)
-				if (state < 0) {
-					call.set_last_error(state == -3 ? 5 : 6);
-					return wait_failed;
+		// Objects of the process's table are taken there, all at once for a wait for all, and an abandoned mutex is reported as such.
+		const auto table = table_objects(objects, resolved);
+		// Objects other processes share, when the wait is for them alone, with the words they change.
+		std::vector<std::shared_ptr<KernelObject>> held;
+		std::vector<std::atomic<uint32_t> *> words;
+		if (table.empty() && threads.waits_outside() && NativeThreads::can_wait_words())
+			for (const auto handle : resolved) {
+				auto object = objects.object(handle);
+				auto *word = object ? object->wait_word() : nullptr;
+				if (!word) {
+					held.clear();
+					words.clear();
+					break;
 				}
-			if (all) {
+				held.push_back(std::move(object));
+				words.push_back(word);
+			}
+		for (;;) {
+			// Objects of the process's table are taken there, and only whether their handles may be waited for is looked at first: reading
+			// each one's state cost more than the wait, a call into the kernel each where its objects are the kernel's (native/waits).
+			std::vector<int> current;
+			if (!table.empty()) {
+				for (size_t index = 0; index < resolved.size(); ++index)
+					if (const int state = waited.usable(index); state < 0) {
+						call.set_last_error(state == -3 ? 5 : 6);
+						return wait_failed;
+					}
+			} else {
+				current = states();
+				for (const auto state : current)
+					if (state < 0) {
+						call.set_last_error(state == -3 ? 5 : 6);
+						return wait_failed;
+					}
+			}
+			if (!table.empty()) {
+				if (const uint32_t taken = raven_waits_wait(kernel_waits(), id, table.data(), uint32_t(table.size()), all, 0, 0); taken != wait_timeout)
+					return taken;
+				// A pulse granted to this thread alone (see EventPulses) is not in the table: the event shows it to its wait.
+				if (!all) {
+					current = states();
+					for (size_t index = 0; index < current.size(); ++index)
+						if (current[index] == 1 && waited.try_consume(index, id))
+							return uint32_t(index);
+				}
+			} else if (all) {
 				if (std::all_of(current.begin(), current.end(), [](int state) { return state == 1; })) {
 					bool taken = true;
-					for (const auto handle : resolved)
-						taken = objects.try_consume(handle, id) && taken;
+					for (size_t index = 0; index < resolved.size(); ++index)
+						taken = waited.try_consume(index, id) && taken;
 					if (taken)
 						return 0;
 				}
 			} else {
 				for (size_t index = 0; index < current.size(); ++index)
-					if (current[index] == 1 && objects.try_consume(resolved[index], id))
+					if (current[index] == 1 && waited.try_consume(index, id))
 						return uint32_t(index);
 			}
 			if (milliseconds == 0 || (wake && std::chrono::steady_clock::now() >= *wake)) {
@@ -278,23 +368,85 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 				return wait_io_completion;
 			if (milliseconds == 0 || (wake && std::chrono::steady_clock::now() >= *wake))
 				return wait_timeout;
+			// A wait on objects of the process's table alone blocks its host thread there, outside the runtime, until whoever sets what
+			// it waits for wakes it with what it took (see native/waits). The others are looked at again when something may have ended them.
+			if (threads.waits_outside() && !table.empty()) {
+				raven_waits_take_apcs(kernel_waits(), id);
+				if (alertable && !threads.current().apcs.empty())
+					continue;
+				// The thread that sets one of them lets this one run first (see NativeThreads::hand_over_to).
+				struct Announced {
+					NativeThreads &threads;
+					GuestThread &self;
+					Announced(NativeThreads &threads, GuestThread &self, const std::vector<uint32_t> &table) : threads(threads), self(self)
+					{
+						self.waits_on = table;
+						threads.table_waiters.fetch_add(1, std::memory_order_release);
+						for (const uint32_t object : table)
+							threads.table_waited[object % threads.table_waited.size()].fetch_add(1, std::memory_order_acq_rel);
+					}
+					~Announced()
+					{
+						for (const uint32_t object : self.waits_on)
+							threads.table_waited[object % threads.table_waited.size()].fetch_sub(1, std::memory_order_release);
+						threads.table_waiters.fetch_sub(1, std::memory_order_release);
+						self.waits_on.clear();
+					}
+				} announced(threads, threads.current(), table);
+				const uint32_t result = threads.wait_outside([&](std::optional<std::chrono::steady_clock::time_point> until) {
+					uint64_t timeout = raven_wait_infinite;
+					if (until)
+						timeout = uint64_t(std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::nanoseconds>(*until - std::chrono::steady_clock::now()).count()));
+					return raven_waits_wait(kernel_waits(), id, table.data(), uint32_t(table.size()), all, alertable, timeout);
+				}, wake);
+				if (result < 64 || (result >= wait_abandoned && result < wait_abandoned + 64))
+					return result;
+				if (result == wait_io_completion) {
+					raven_waits_take_apcs(kernel_waits(), id);
+					if (run_apcs())
+						return wait_io_completion;
+				}
+				if (result == wait_timeout)
+					return wait_timeout;
+				continue;
+			}
+			// A wait on shared objects alone sleeps on their words, outside the runtime as well; an APC it is called away for is looked at
+			// above when it is alertable.
+			if (!held.empty()) {
+				auto &self = threads.current();
+				const uint32_t result = threads.wait_outside([&](std::optional<std::chrono::steady_clock::time_point> until) {
+					return NativeThreads::sleep_on_words(self, held, words, all, until);
+				}, wake);
+				if (result < 64 || result == wait_timeout)
+					return result;
+				continue;
+			}
 			// A timer among the handles turns signaled at its due time with nobody announcing it: the wait looks again then.
 			auto until = wake;
-			for (const auto handle : resolved)
-				if (const auto object = objects.object(handle))
-					if (const auto due = object->wakes_at(); due && (!until || *due < *until))
-						until = due;
+			for (size_t index = 0; index < resolved.size(); ++index)
+				if (const auto due = waited.wakes_at(index); due && (!until || *due < *until))
+					until = due;
 			threads.block(ready, until);
 		}
 	};
 	registry.add("WaitForSingleObject", 2, [wait](ApiCall &call) { call.ret(wait(call, {call[0]}, false, call.u32(1), false)); });
 	registry.add("WaitForSingleObjectEx", 3, [wait](ApiCall &call) { call.ret(wait(call, {call[0]}, false, call.u32(1), call.u32(2))); });
 	// A handle array holds handles of the program's width; the 32-bit pseudo handles widen to the values the 64-bit side knows them by.
-	const auto handle_at = [](ApiCall &call, uint64_t array, uint32_t index) -> uint64_t {
-		if (call.pointer_width() == 8)
-			return call.load<uint64_t>(array + index * 8ULL);
-		const uint32_t value = call.load<uint32_t>(array + index * 4ULL);
-		return value >= 0xfffffffaU ? uint64_t(int64_t(int32_t(value))) : value;
+	// The array of handles a wait is given, in one read of the guest's memory: one read for each handle cost more than the wait itself.
+	const auto handles_at = [](ApiCall &call, uint64_t array, uint32_t count) {
+		const size_t width = call.pointer_width();
+		const auto bytes = call.read(array, count * width);
+		std::vector<uint64_t> handles(count);
+		for (uint32_t index = 0; index < count; ++index) {
+			if (width == 8) {
+				std::memcpy(&handles[index], bytes.data() + index * 8, 8);
+				continue;
+			}
+			uint32_t value = 0;
+			std::memcpy(&value, bytes.data() + index * 4, 4);
+			handles[index] = value >= 0xfffffffaU ? uint64_t(int64_t(int32_t(value))) : value;
+		}
+		return handles;
 	};
 	// The end of a native timeout: a LARGE_INTEGER in 100-nanosecond units, negative for a time from now and positive for a system time.
 	// Without one, or with one too far away to count, there is none.
@@ -315,15 +467,13 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 			return std::nullopt;
 		return std::chrono::steady_clock::now() + std::chrono::nanoseconds(from_now * 100);
 	};
-	const auto multiple = [wait, handle_at, &objects, &threads](ApiCall &call, bool alertable) {
+	const auto multiple = [wait, handles_at, &objects, &threads](ApiCall &call, bool alertable) {
 		const uint32_t count = call.u32(0);
 		if (count > 64 || !call[1]) {
 			call.fail(87, wait_failed);
 			return;
 		}
-		std::vector<uint64_t> handles(count);
-		for (uint32_t index = 0; index < count; ++index)
-			handles[index] = handle_at(call, call[1], index);
+		const auto handles = handles_at(call, call[1], count);
 		// RAVEN_TRACE_WAITS also names what a wait for several objects is given: each handle, its type and whether it is signaled.
 		static const bool traced = std::getenv("RAVEN_TRACE_WAITS") != nullptr;
 		if (traced && call.u32(3)) {
@@ -356,28 +506,24 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 	};
 	registry.add("NtWaitForSingleObject", 3, [native_wait](ApiCall &call) { native_wait(call, {call[0]}, false, call.u32(1) & 0xff, call[2]); });
 	// NtWaitForMultipleObjects: wait type 0 waits for all of the handles, 1 for any.
-	registry.add("NtWaitForMultipleObjects", 5, [native_wait, handle_at](ApiCall &call) {
+	registry.add("NtWaitForMultipleObjects", 5, [native_wait, handles_at](ApiCall &call) {
 		const uint32_t count = call.u32(0);
 		if (!count || count > 64 || !call[1] || call.u32(2) > 1) {
 			call.ret(0xc000000dU);
 			return;
 		}
-		std::vector<uint64_t> handles(count);
-		for (uint32_t index = 0; index < count; ++index)
-			handles[index] = handle_at(call, call[1], index);
-		native_wait(call, handles, call.u32(2) == 0, call.u32(3) & 0xff, call[4]);
+		native_wait(call, handles_at(call, call[1], count), call.u32(2) == 0, call.u32(3) & 0xff, call[4]);
 	});
 	// The input event follows the explicit handles, so a signaled handle wins a wait-any tie.
-	const auto message_wait = [&context, &objects, &threads, handle_at, run_apcs](ApiCall &call, uint32_t count, uint64_t array,
+	const auto message_wait = [&context, &objects, &threads, handles_at, run_apcs](ApiCall &call, uint32_t count, uint64_t array,
 			uint32_t milliseconds, uint32_t mask, uint32_t flags) -> uint32_t {
 		// 0x2000 is the bit WPF's dispatcher asks for with the input ones; nothing here raises it.
 		if (count > 63 || (count && !array) || (flags & ~7U) || (mask & ~0x3dffU)) {
 			call.set_last_error(87);
 			return wait_failed;
 		}
-		std::vector<uint64_t> handles(count);
+		const auto handles = count ? handles_at(call, array, count) : std::vector<uint64_t>{};
 		for (uint32_t index = 0; index < count; ++index) {
-			handles[index] = handle_at(call, array, index);
 			if (std::find(handles.begin(), handles.begin() + index, handles[index]) != handles.begin() + index) {
 				call.set_last_error(87);
 				return wait_failed;
@@ -393,10 +539,11 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 		std::optional<std::chrono::steady_clock::time_point> wake;
 		if (milliseconds != UINT32_MAX)
 			wake = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+		WaitedObjects waited(objects, handles);
 		for (;;) {
 			std::vector<int> states;
-			for (const auto handle : handles) {
-				const int state = handle == current_thread_pseudo ? -2 : objects.signaled(handle, id);
+			for (size_t index = 0; index < handles.size(); ++index) {
+				const int state = handles[index] == current_thread_pseudo ? -2 : waited.signaled(index, id);
 				if (state < 0) {
 					call.set_last_error(state == -3 ? 5 : 6);
 					return wait_failed;
@@ -406,26 +553,25 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 			if (all) {
 				if (std::all_of(states.begin(), states.end(), [](int state) { return state == 1; }) && input()) {
 					bool taken = true;
-					for (const auto handle : handles) taken = objects.try_consume(handle, id) && taken;
+					for (size_t index = 0; index < handles.size(); ++index) taken = waited.try_consume(index, id) && taken;
 					if (taken) return 0;
 				}
 			} else {
 				for (size_t index = 0; index < states.size(); ++index)
-					if (states[index] == 1 && objects.try_consume(handles[index], id)) return uint32_t(index);
+					if (states[index] == 1 && waited.try_consume(index, id)) return uint32_t(index);
 				if (input()) return count;
 			}
 			if (alertable && !me->apcs.empty() && run_apcs()) return wait_io_completion;
 			if (!milliseconds || (wake && std::chrono::steady_clock::now() >= *wake)) return wait_timeout;
 			auto until = wake;
-			for (const auto handle : handles)
-				if (const auto object = objects.object(handle))
-					if (const auto due = object->wakes_at(); due && (!until || *due < *until)) until = due;
+			for (size_t index = 0; index < handles.size(); ++index)
+				if (const auto due = waited.wakes_at(index); due && (!until || *due < *until)) until = due;
 			HostWait waiting;
 			threads.block([&] {
 				if (alertable && !me->apcs.empty()) return true;
 				bool any = false, every = true;
-				for (const auto handle : handles) {
-					const int state = objects.signaled(handle, id);
+				for (size_t index = 0; index < handles.size(); ++index) {
+					const int state = waited.signaled(index, id);
 					if (state < 0) return true;
 					any |= state == 1;
 					every &= state == 1;
@@ -580,19 +726,26 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 	});
 	// BindIoCompletionCallback: every bound file posts to one completion port of the process, with its callback as the key, and the guest
 	// RTL's worker threads hand each finished operation to its callback. The threads start with the first binding.
+	// The guest's threads take turns on one thread here, so the first binding is guarded by a flag they wait on in turn: a mutex of the
+	// host would stop them all when a thread is switched out while it makes the port and another comes to bind.
 	struct IoBinding {
 		uint64_t port = 0;
-		std::mutex lock;
+		bool busy = false;
+	};
+	const auto hold = [&threads](const std::shared_ptr<IoBinding> &binding) {
+		threads.block([binding] { return !binding->busy; }, std::nullopt);
+		binding->busy = true;
+		return std::shared_ptr<void>(nullptr, [binding](void *) { binding->busy = false; });
 	};
 	auto io_binding = std::make_shared<IoBinding>();
-	registry.add("BindIoCompletionCallback", 3, [&registry, &context, io_binding](ApiCall &call) {
+	registry.add("BindIoCompletionCallback", 3, [&registry, &context, io_binding, hold](ApiCall &call) {
 		const auto associate = registry.find("CreateIoCompletionPort");
 		const auto create = registry.find("CreateThread");
 		if (!call[1] || !associate || !create) {
 			call.fail(87);
 			return;
 		}
-		const std::lock_guard guard(io_binding->lock);
+		const auto held = hold(io_binding);
 		if (!io_binding->port) {
 			uint64_t worker, dequeue;
 			try {
@@ -623,6 +776,72 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 		associate->second(bound);
 		call.ret(bound.result ? 1 : 0);
 	});
+	// CreateThreadpoolIo binds a file to the pool in the same way, to a completion port of its own whose key is the I/O object: the callback,
+	// its context and the count of its callbacks running, which the guest RTL's threads keep.
+	auto pool_binding = std::make_shared<IoBinding>();
+	registry.add("CreateThreadpoolIo", 4, [&registry, &context, pool_binding, hold](ApiCall &call) {
+		const auto associate = registry.find("CreateIoCompletionPort");
+		const auto create = registry.find("CreateThread");
+		if (!call[1] || !associate || !create) {
+			call.fail(87, 0);
+			return;
+		}
+		const auto held = hold(pool_binding);
+		if (!pool_binding->port) {
+			uint64_t worker, dequeue;
+			try {
+				worker = context.modules.resolve({"raven-rtl.dll", "RavenThreadpoolIoWorker", 0, false, 0});
+				dequeue = context.modules.resolve({"kernel32.dll", "GetQueuedCompletionStatus", 0, false, 0});
+			} catch (const std::exception &) {
+				call.fail(50, 0);
+				return;
+			}
+			ApiCall made(call.process, call.environment, {UINT64_MAX, 0, 0, 0});
+			associate->second(made);
+			if (!made.result) {
+				call.ret(0);
+				return;
+			}
+			const auto binding = context.allocator.allocate(16);
+			call.store_pointer(binding, dequeue);
+			call.store_pointer(binding + 8, made.result);
+			for (int index = 0; index < 2; ++index) {
+				ApiCall thread(call.process, call.environment, {0, 0, worker, binding, 0, 0});
+				create->second(thread);
+				if (thread.result)
+					context.objects.close(thread.result);
+			}
+			pool_binding->port = made.result;
+		}
+		const auto io = context.allocator.allocate(24);
+		call.store_pointer(io, call[1]);
+		call.store_pointer(io + 8, call[2]);
+		call.store<uint32_t>(io + 16, 0);
+		ApiCall bound(call.process, call.environment, {call[0], pool_binding->port, io, 0});
+		associate->second(bound);
+		if (!bound.result) {
+			call.ret(0);
+			return;
+		}
+		call.ret(io);
+	});
+	// Every finished operation is handed to the callback, so there is nothing to note before one starts or after one fails at once.
+	registry.add("StartThreadpoolIo", 1, [](ApiCall &) {});
+	registry.add("CancelThreadpoolIo", 1, [](ApiCall &) {});
+	// The callbacks already running finish; the object stays where it is, as a packet still queued for it may yet be handed out.
+	registry.add("WaitForThreadpoolIoCallbacks", 2, [&threads](ApiCall &call) {
+		if (!call[0])
+			return;
+		auto &process = call.process;
+		const uint64_t running = call[0] + 16;
+		threads.block([&process, running] {
+			uint32_t count = 0;
+			const auto bytes = process.read_memory(running, 4);
+			std::memcpy(&count, bytes.data(), 4);
+			return count == 0;
+		}, std::nullopt);
+	});
+	registry.add("CloseThreadpoolIo", 1, [](ApiCall &) {});
 	registry.add("GetExitCodeThread", 2, [thread_from, &objects](ApiCall &call) {
 		if (const auto remote = objects.object_as<RemoteThreadObject>(call[0])) {
 			call.store<uint32_t>(call[1], remote->code().value_or(259));
@@ -658,7 +877,7 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 		else
 			call.ret(previous);
 	});
-	registry.add("ResumeThread", 1, [thread_from, &objects](ApiCall &call) {
+	registry.add("ResumeThread", 1, [thread_from, &objects, &threads](ApiCall &call) {
 		// The main thread of a child that was started suspended runs when this opens its gate.
 		if (const auto child = objects.object_as<ChildThreadObject>(call[0])) {
 			call.ret(child->resume());
@@ -670,11 +889,12 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 			return;
 		}
 		const auto previous = thread->suspend_count;
-		if (thread->suspend_count > 0)
-			--thread->suspend_count;
+		threads.resume(*thread);
 		call.ret(uint32_t(previous));
 	});
-	// The registers of a thread as a CONTEXT (x64): the control and integer groups, from where the thread stopped.
+	// The registers of a thread as a CONTEXT (x64), from where the thread stopped: the control and integer groups, the floating-point
+	// state, and the upper halves of the YMM registers when the context has an extended area whose mask asks for them. The .NET runtime
+	// takes all of it from a thread it interrupts for a collection, and puts it back when the thread goes on.
 	registry.add("GetThreadContext", 2, [thread_from, &threads](ApiCall &call) {
 		if (call.pointer_width() == 4 || !call[1]) {
 			call.fail(call[1] ? 50 : 87);
@@ -702,10 +922,24 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 			put(0xb8, registers.r8); put(0xc0, registers.r9); put(0xc8, registers.r10); put(0xd0, registers.r11);
 			put(0xd8, registers.r12); put(0xe0, registers.r13); put(0xe8, registers.r14); put(0xf0, registers.r15);
 		}
+		const auto &state = thread->id == threads.current_id() ? call.process.context() : thread->snapshot.context;
+		if ((flags & 0x8) && state.xstate.size() >= 512) {
+			call.write(call[1] + x64_context::float_area, std::span<const uint8_t>(state.xstate.data(), 512));
+			call.write(call[1] + x64_context::mxcsr, std::span<const uint8_t>(state.xstate.data() + 24, 4));
+		}
+		if (const uint64_t area = context_extended_area(call.process, call[1])) {
+			const uint64_t asked = call.load<uint64_t>(area) & x64_context::avx_mask;
+			call.store<uint64_t>(area, asked);
+			if (asked) {
+				const auto halves = native_avx(state);
+				call.write(area + x64_context::extended_header, halves);
+			}
+		}
 		call.ret(1);
 	});
-	// The registers of a suspended thread from a CONTEXT (x64): the control and integer groups, which it continues with when resumed. A
-	// thread that is not suspended, the caller among them, keeps its registers: Windows leaves the outcome of that undefined.
+	// The registers of a suspended thread from a CONTEXT (x64), which it continues with when resumed: the control and integer groups,
+	// the floating-point state, and the upper halves of the YMM registers from an extended area, which are cleared when its mask leaves
+	// them out. A thread that is not suspended, the caller among them, keeps its registers: Windows leaves the outcome of that undefined.
 	registry.add("SetThreadContext", 2, [thread_from, &threads, &context](ApiCall &call) {
 		if (call.pointer_width() == 4 || !call[1]) {
 			call.fail(call[1] ? 50 : 87);
@@ -736,7 +970,24 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 			registers.r8 = get(0xb8); registers.r9 = get(0xc0); registers.r10 = get(0xc8); registers.r11 = get(0xd0);
 			registers.r12 = get(0xd8); registers.r13 = get(0xe0); registers.r14 = get(0xe8); registers.r15 = get(0xf0);
 		}
-		context.process.set_thread_registers(thread->snapshot, registers);
+		context.threads.set_registers(*thread, registers);
+		// The floating-point and extended state wait in the thread's saved state for its next turn; a thread that runs on a task of its
+		// own has them written into its task, which holds them while the thread is paused.
+		auto &state = thread->snapshot.context;
+		if (!context.process.parallel() || thread->paused) {
+			if ((flags & 0x8) && state.xstate.size() >= 512) {
+				const auto area = call.read(call[1] + x64_context::float_area, 512);
+				std::memcpy(state.xstate.data(), area.data(), 512);
+			}
+			if (const uint64_t area = context_extended_area(call.process, call[1])) {
+				if (call.load<uint64_t>(area) & x64_context::avx_mask)
+					set_native_avx(state, call.read(area + x64_context::extended_header, x64_context::avx_size).data());
+				else
+					set_native_avx(state, nullptr);
+			}
+			if (context.process.parallel())
+				context.threads.set_xstate(*thread);
+		}
 		call.ret(1);
 	});
 	// A thread's description is a name the program gives it; it is kept per thread and handed back in memory the program frees with LocalFree.
@@ -1079,19 +1330,25 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 			call.ret(0xc0000005U);
 		}
 	});
-	registry.add("QueueUserAPC", 3, [thread_from](ApiCall &call) {
+	registry.add("QueueUserAPC", 3, [thread_from, &threads](ApiCall &call) {
 		const auto thread = thread_from(call[1]);
 		if (!thread) {
 			call.fail(6);
 			return;
 		}
-		thread->apcs.push_back({call[0], call[2]});
+		// A thread that has ended runs no more APCs. QueueUserAPC's documentation: "When the thread is in the process of being terminated,
+		// calling QueueUserAPC to add to the thread's APC queue will fail with (31) ERROR_GEN_FAILURE."
+		if (thread->state == GuestThread::State::done) {
+			call.fail(31);
+			return;
+		}
+		threads.queue_apc(*thread, {call[0], call[2]});
 		call.ret(1);
 	});
 	// QueueUserAPC2 with no flags queues the APC QueueUserAPC queues. Special user-mode APCs, which interrupt a thread that is not in
 	// an alertable wait (QUEUE_USER_APC_FLAGS_SPECIAL_USER_APC, with or without the interrupted context), are not delivered here, so
 	// those flags are refused, as callers that test for them expect from a system without them.
-	registry.add("QueueUserAPC2", 4, [thread_from](ApiCall &call) {
+	registry.add("QueueUserAPC2", 4, [thread_from, &threads](ApiCall &call) {
 		if (call.u32(3)) {
 			call.fail(87);
 			return;
@@ -1101,7 +1358,12 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 			call.fail(6);
 			return;
 		}
-		thread->apcs.push_back({call[0], call[2]});
+		// As in QueueUserAPC.
+		if (thread->state == GuestThread::State::done) {
+			call.fail(31);
+			return;
+		}
+		threads.queue_apc(*thread, {call[0], call[2]});
 		call.ret(1);
 	});
 
@@ -1345,6 +1607,7 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 		auto mutex = std::make_shared<MutexObject>();
 		bool existed = false;
 		if (name_address) {
+			mutex->leave_table();
 			uint32_t error = 0;
 			mutex->shared = SharedFile::open("mutex", call.wide(name_address, 259), sizeof(MutexState), true, existed, error, [](void *memory) { new (memory) MutexState(); });
 			if (!mutex->shared) {
@@ -1371,6 +1634,7 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 			return;
 		}
 		auto mutex = std::make_shared<MutexObject>();
+		mutex->leave_table();
 		bool existed = false;
 		uint32_t error = 0;
 		mutex->shared = SharedFile::open("mutex", call.wide(call[2], 259), sizeof(MutexState), false, existed, error);
@@ -1415,6 +1679,7 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 		} else {
 			semaphore->state->count = int32_t(initial);
 			semaphore->state->maximum = int32_t(maximum);
+			semaphore->waits_object = raven_waits_create(kernel_waits(), raven_semaphore, uint32_t(initial), uint32_t(maximum));
 		}
 		const auto made = objects.add_object(semaphore);
 		if (made.status) {
@@ -1457,6 +1722,16 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 				return;
 			}
 		}
+		if (semaphore->waits_object) {
+			uint32_t previous = 0;
+			if (amount <= 0 || raven_waits_release_semaphore(kernel_waits(), semaphore->waits_object, uint32_t(amount), &previous)) {
+				call.fail(298);
+				return;
+			}
+			if (call[2]) call.store<int32_t>(call[2], int32_t(previous));
+			call.ret(1);
+			return;
+		}
 		auto current = semaphore->state->count.load();
 		for (;;) {
 			if (amount <= 0 || int64_t(current) + amount > semaphore->state->maximum) {
@@ -1466,14 +1741,80 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 			if (semaphore->state->count.compare_exchange_weak(current, current + amount))
 				break;
 		}
-		if (semaphore->shared)
+		if (semaphore->shared) {
+			wake_word(semaphore->wait_word());
 			announce_shared_change();
+		}
 		if (call[2]) call.store<int32_t>(call[2], current);
 		call.ret(1);
 	});
 
 
-	// Thread pool work items run on short-lived guest threads; waiting on them joins those threads.
+	// Submitted work is queued for the pool's worker threads, which the guest RTL runs: each takes one item after another from the pool's
+	// completion port. Windows keeps as many workers running as there are processors and adds one when every running worker waits, or
+	// when the queue has not moved for a while; a program that submits a request for a thread every time it takes an item, as .NET's
+	// dispatcher does, would otherwise start a thread for each of them, all contending for the same work. Without the guest RTL (a 32-bit
+	// process) every submission runs on a thread of its own.
+	struct WorkPool {
+		uint64_t queue = 0, worker = 0;
+		bool unavailable = false;
+		std::vector<std::shared_ptr<GuestThread>> workers;
+		int32_t taken = 0;
+		std::chrono::steady_clock::time_point progress{};
+	};
+	auto pool = std::make_shared<WorkPool>();
+	const auto load32 = [&context](uint64_t address) {
+		int32_t value = 0;
+		const auto bytes = context.process.read_memory(address, 4);
+		std::memcpy(&value, bytes.data(), 4);
+		return value;
+	};
+	const auto add32 = [&context](uint64_t address, int32_t delta) {
+		for (;;) {
+			int32_t value = 0;
+			const auto bytes = context.process.read_memory(address, 4);
+			std::memcpy(&value, bytes.data(), 4);
+			if (context.process.compare_exchange(address, uint32_t(value), uint32_t(value + delta), 4) == uint32_t(value))
+				return;
+		}
+	};
+	const auto work_finished = [load32](const std::shared_ptr<WorkObject> &work) {
+		return std::all_of(work->running.begin(), work->running.end(), [](const auto &thread) { return thread->state == GuestThread::State::done; }) &&
+			(!work->block || load32(work->block + 24) <= 0);
+	};
+	const auto grow = [pool, load32, &context, &threads] {
+		if (!pool->queue)
+			return;
+		const int32_t free = load32(pool->queue + 16), queued = load32(pool->queue + 20), taken = load32(pool->queue + 24);
+		const auto now = std::chrono::steady_clock::now();
+		if (taken != pool->taken || queued <= 0) {
+			pool->taken = taken;
+			pool->progress = now;
+		}
+		if (queued <= free)
+			return;
+		std::erase_if(pool->workers, [](const auto &thread) { return thread->state == GuestThread::State::done; });
+		static const size_t processors = std::max(1U, std::min(64U, std::thread::hardware_concurrency()));
+		const auto running = size_t(std::count_if(pool->workers.begin(), pool->workers.end(), [](const auto &thread) {
+			return thread->state == GuestThread::State::ready || thread->state == GuestThread::State::running;
+		}));
+		// The limit leaves room for the program's own threads under the runtime's limit on guest threads.
+		const bool stalled = now - pool->progress >= std::chrono::milliseconds(500);
+		if ((running >= processors && !stalled) || pool->workers.size() >= 192)
+			return;
+		// A new thread maps its stack, which a serial guest answered without stopping cannot have done: the next decision adds it.
+		if (context.process.serving() && !context.process.parallel())
+			return;
+		try {
+			pool->workers.push_back(threads.create(pool->worker, pool->queue, 1024 * 1024, false));
+		} catch (const std::runtime_error &) {
+			return;
+		}
+		pool->progress = now;
+	};
+	threads.add_service(grow);
+	threads.add_pump(grow);
+	threads.add_external([pool, load32] { return pool->queue && load32(pool->queue + 20) > 0; });
 	registry.add("CreateThreadpoolWork", 3, [&objects](ApiCall &call) {
 		auto work = std::make_shared<WorkObject>();
 		work->callback = call[0];
@@ -1485,23 +1826,71 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 			if (const auto group = objects.object_as<CleanupGroupObject>(call.load_pointer(call[2] + 2 * call.pointer_width())))
 				group->members.push_back(made.value);
 	});
-	registry.add("SubmitThreadpoolWork", 1, [&objects, &threads, &context](ApiCall &call) {
+	registry.add("SubmitThreadpoolWork", 1, [&registry, &objects, &threads, &context, pool, add32, grow](ApiCall &call) {
+		// A submission wakes a worker and may start one, which needs the thread stopped: answered without stopping, a call that gave up
+		// half way would run again and queue its work twice.
+		if (call.process.serving()) {
+			call.process.decline_served();
+			return;
+		}
 		const auto work = objects.object_as<WorkObject>(call[0]);
 		if (!work)
 			return;
-		// TP_CALLBACK_INSTANCE is opaque to callbacks; the work handle itself stands in for it.
-		const auto instance = context.allocator.allocate(64);
-		const auto thread = threads.create(work->callback, work->parameter, 1024 * 1024, false);
-		thread->arguments = {instance, work->parameter, call[0]};
-		work->running.push_back(thread);
+		const auto associate = registry.find("CreateIoCompletionPort");
+		const auto post = registry.find("PostQueuedCompletionStatus");
+		if (!pool->queue && !pool->unavailable) {
+			pool->unavailable = true;
+			uint64_t dequeue = 0;
+			try {
+				if (call.pointer_width() == 8 && associate && post) {
+					pool->worker = context.modules.resolve({"raven-rtl.dll", "RavenThreadpoolWorker", 0, false, 0});
+					dequeue = context.modules.resolve({"kernel32.dll", "GetQueuedCompletionStatus", 0, false, 0});
+				}
+			} catch (const std::exception &) {
+				dequeue = 0;
+			}
+			if (dequeue) {
+				ApiCall made(call.process, call.environment, {UINT64_MAX, 0, 0, 0});
+				associate->second(made);
+				if (made.result) {
+					const auto queue = context.allocator.allocate(32);
+					call.store_pointer(queue, dequeue);
+					call.store_pointer(queue + 8, made.result);
+					call.store<uint32_t>(queue + 16, 0);
+					call.store<uint32_t>(queue + 20, 0);
+					call.store<uint32_t>(queue + 24, 0);
+					pool->queue = queue;
+					pool->unavailable = false;
+				}
+			}
+		}
+		if (!pool->queue) {
+			// TP_CALLBACK_INSTANCE is opaque to callbacks; the work handle itself stands in for it.
+			const auto instance = context.allocator.allocate(64);
+			const auto thread = threads.create(work->callback, work->parameter, 1024 * 1024, false);
+			thread->arguments = {instance, work->parameter, call[0]};
+			work->running.push_back(thread);
+			return;
+		}
+		if (!work->block) {
+			work->block = context.allocator.allocate(32);
+			call.store_pointer(work->block, work->callback);
+			call.store_pointer(work->block + 8, work->parameter);
+			call.store_pointer(work->block + 16, call[0]);
+			call.store<uint32_t>(work->block + 24, 0);
+		}
+		add32(work->block + 24, 1);
+		add32(pool->queue + 20, 1);
+		ApiCall posted(call.process, call.environment, {call.load_pointer(pool->queue + 8), 0, work->block, 0});
+		post->second(posted);
+		grow();
 	});
-	registry.add("WaitForThreadpoolWorkCallbacks", 2, [&objects, &threads](ApiCall &call) {
+	// Callbacks still queued run too: the completion port they wait in keeps them, so only waiting for every submission is exact here.
+	registry.add("WaitForThreadpoolWorkCallbacks", 2, [&objects, &threads, work_finished](ApiCall &call) {
 		const auto work = objects.object_as<WorkObject>(call[0]);
 		if (!work)
 			return;
-		threads.block([work] {
-			return std::all_of(work->running.begin(), work->running.end(), [](const auto &thread) { return thread->state == GuestThread::State::done; });
-		}, std::nullopt);
+		threads.block([work, work_finished] { return work_finished(work); }, std::nullopt);
 	});
 	registry.add("CloseThreadpoolWork", 1, [&objects](ApiCall &call) { objects.close(call[0]); });
 	registry.add("CreateThreadpool", 1, [&objects](ApiCall &call) {
@@ -1532,26 +1921,33 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 		else
 			call.ret(made.value);
 	});
-	// The members' callbacks finish first (pending ones run too, since submitted work starts at once), then their handles close.
-	registry.add("CloseThreadpoolCleanupGroupMembers", 3, [&objects, &threads](ApiCall &call) {
+	// The members' timers stop and their callbacks finish (queued ones run too: the pool's completion port keeps them), then their handles close.
+	registry.add("CloseThreadpoolCleanupGroupMembers", 3, [&objects, &threads, work_finished](ApiCall &call) {
 		const auto group = objects.object_as<CleanupGroupObject>(call[0]);
 		if (!group)
 			return;
 		std::vector<std::shared_ptr<WorkObject>> works;
-		for (const auto member : group->members)
+		std::vector<std::shared_ptr<QueueTimer>> timers;
+		for (const auto member : group->members) {
 			if (const auto work = objects.object_as<WorkObject>(member))
 				works.push_back(work);
-		threads.block([works] {
-			return std::all_of(works.begin(), works.end(), [](const auto &work) {
-				return std::all_of(work->running.begin(), work->running.end(), [](const auto &thread) { return thread->state == GuestThread::State::done; });
-			});
+			if (const auto timer = objects.object_as<QueueTimer>(member)) {
+				timer->active = false;
+				timer->closed = true;
+				timers.push_back(timer);
+			}
+		}
+		threads.block([works, timers, work_finished] {
+			const auto done = [](const auto &thread) { return !thread || thread->state == GuestThread::State::done; };
+			return std::all_of(works.begin(), works.end(), work_finished) &&
+				std::all_of(timers.begin(), timers.end(), [done](const auto &timer) { return done(timer->running); });
 		}, std::nullopt);
 		for (const auto member : group->members)
 			objects.close(member);
 		group->members.clear();
 	});
 	registry.add("CloseThreadpoolCleanupGroup", 1, [&objects](ApiCall &call) { objects.close(call[0]); });
-	// The pool grows as callbacks need threads, so a long callback needs no notice; another thread is always available.
+	// The pool adds a thread when its queue stops moving, so a long callback needs no notice.
 	registry.add("CallbackMayRunLong", 1, [](ApiCall &call) { call.ret(1); });
 
 	// Registered waits are checked whenever every thread waits; a satisfied one starts its callback on a new guest thread.
@@ -1637,11 +2033,27 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 	const auto finished = [](const std::shared_ptr<QueueTimer> &timer) { return !timer->running || timer->running->state == GuestThread::State::done; };
 	threads.add_pump([timer_state, &objects, &threads, finished] {
 		const auto now = std::chrono::steady_clock::now();
+		std::erase_if(timer_state->timers, [](const auto &timer) { return timer->closed; });
 		for (const auto &timer : timer_state->timers) {
 			if (!timer->active || now < timer->deadline || !finished(timer))
 				continue;
+			if (timer->multimedia && (timer->flags & 0x30)) {
+				objects.set_event(timer->callback, true);
+				if (timer->flags & 0x20)
+					objects.set_event(timer->callback, false);
+				if (!timer->period)
+					timer->active = false;
+				else
+					timer->deadline = std::max(timer->deadline + std::chrono::milliseconds(timer->period), now);
+				continue;
+			}
 			const auto thread = threads.create(timer->callback, timer->parameter, 1024 * 1024, false);
-			thread->arguments = {timer->parameter, 1};
+			if (timer->multimedia)
+				thread->arguments = {timer->multimedia, 0, timer->parameter, 0, 0};
+			else if (timer->instance)
+				thread->arguments = {timer->instance, timer->parameter, timer->handle};
+			else
+				thread->arguments = {timer->parameter, 1};
 			timer->running = thread;
 			if (!timer->period || (timer->flags & 0x8))
 				timer->active = false;
@@ -1715,6 +2127,41 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 		call.store_pointer(call[0], made.value);
 		call.ret(1);
 	});
+	// Multimedia timers: timeSetEvent runs a callback once or periodically after a delay in milliseconds, through the timer pump; the
+	// timer's number, never 0, is what timeKillEvent takes.
+	auto multimedia = std::make_shared<std::map<uint32_t, std::shared_ptr<QueueTimer>>>();
+	registry.add("timeSetEvent", 5, [timer_state, multimedia](ApiCall &call) {
+		if (!call[2] || call.u32(0) == 0) {
+			call.ret(0);
+			return;
+		}
+		static uint32_t next = 1;
+		auto timer = std::make_shared<QueueTimer>();
+		timer->multimedia = next++;
+		timer->callback = call[2];
+		timer->parameter = call[3];
+		timer->flags = call.u32(4);
+		timer->period = (timer->flags & 1) ? call.u32(0) : 0;
+		timer->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(call.u32(0));
+		timer_state->timers.push_back(timer);
+		(*multimedia)[timer->multimedia] = timer;
+		call.ret(timer->multimedia);
+	});
+	registry.add("timeKillEvent", 1, [timer_state, multimedia, &threads, finished](ApiCall &call) {
+		const auto found = multimedia->find(call.u32(0));
+		if (found == multimedia->end()) {
+			call.ret(97);
+			return;
+		}
+		const auto timer = found->second;
+		multimedia->erase(found);
+		timer->active = false;
+		std::erase(timer_state->timers, timer);
+		// TIME_KILL_SYNCHRONOUS: the call returns once a running callback has.
+		if ((timer->flags & 0x100) && !finished(timer))
+			threads.block([timer, finished] { return finished(timer); }, std::nullopt);
+		call.ret(0);
+	});
 	registry.add("ChangeTimerQueueTimer", 4, [&objects](ApiCall &call) {
 		const auto timer = objects.object_as<QueueTimer>(call[1]);
 		if (!timer) {
@@ -1752,6 +2199,87 @@ void register_thread_api(ApiRegistry &registry, KernelContext &context)
 	};
 	registry.add("DeleteTimerQueueEx", 2, [delete_queue](ApiCall &call) { delete_queue(call, call[1]); });
 	registry.add("DeleteTimerQueue", 1, [delete_queue](ApiCall &call) { delete_queue(call, 0); });
+
+	// Thread pool timers share the pump of the timer queues. Setting one replaces its due time and period, a null due time stops it, and
+	// callbacks already started run on; closing it stops it and frees it once its callback has returned.
+	registry.add("CreateThreadpoolTimer", 3, [&objects, &context, timer_state](ApiCall &call) {
+		if (!call[0]) {
+			call.fail(87, 0);
+			return;
+		}
+		auto timer = std::make_shared<QueueTimer>();
+		timer->callback = call[0];
+		timer->parameter = call[1];
+		timer->active = false;
+		// TP_CALLBACK_INSTANCE is opaque to callbacks, so a block of the process stands in for it.
+		timer->instance = context.allocator.allocate(64);
+		const auto made = objects.add_object(timer);
+		if (made.status || !timer->instance) {
+			call.fail(8, 0);
+			return;
+		}
+		timer->handle = made.value;
+		timer_state->timers.push_back(timer);
+		// TP_CALLBACK_ENVIRON: the version, then the pool and the cleanup group as pointers.
+		if (call[2])
+			if (const auto group = objects.object_as<CleanupGroupObject>(call.load_pointer(call[2] + 2 * call.pointer_width())))
+				group->members.push_back(made.value);
+		call.ret(made.value);
+	});
+	// The due time is a FILETIME: negative for an interval from now in units of 100 ns, otherwise a system time, already passed when zero.
+	const auto set_pool_timer = [&objects](ApiCall &call) -> std::shared_ptr<QueueTimer> {
+		const auto timer = objects.object_as<QueueTimer>(call[0]);
+		if (!timer || !timer->instance)
+			return nullptr;
+		if (!call[1]) {
+			timer->active = false;
+			return timer;
+		}
+		const auto due = call.load<int64_t>(call[1]);
+		auto when = std::chrono::steady_clock::now();
+		if (due < 0) {
+			when += std::chrono::microseconds(-due / 10);
+		} else {
+			using namespace std::chrono;
+			const auto now_1601 = duration_cast<microseconds>(system_clock::now().time_since_epoch()).count() + 11644473600000000LL;
+			const auto ahead = due / 10 - now_1601;
+			if (ahead > 0)
+				when += microseconds(ahead);
+		}
+		timer->deadline = when;
+		timer->period = call.u32(2);
+		timer->active = true;
+		return timer;
+	};
+	registry.add("SetThreadpoolTimer", 4, [set_pool_timer](ApiCall &call) {
+		set_pool_timer(call);
+	});
+	// The Ex form reports whether the timer was set before, so a caller knows it took back a callback that was still to come.
+	registry.add("SetThreadpoolTimerEx", 4, [&objects, set_pool_timer](ApiCall &call) {
+		const auto timer = objects.object_as<QueueTimer>(call[0]);
+		const bool was_set = timer && timer->instance && timer->active;
+		set_pool_timer(call);
+		call.ret(was_set ? 1 : 0);
+	});
+	registry.add("IsThreadpoolTimerSet", 1, [&objects](ApiCall &call) {
+		const auto timer = objects.object_as<QueueTimer>(call[0]);
+		call.ret(timer && timer->instance && timer->active ? 1 : 0);
+	});
+	// A callback starts as soon as its timer is due, so none is ever queued to cancel; the wait is for the one that runs.
+	registry.add("WaitForThreadpoolTimerCallbacks", 2, [&objects, &threads, finished](ApiCall &call) {
+		const auto timer = objects.object_as<QueueTimer>(call[0]);
+		if (!timer || finished(timer))
+			return;
+		threads.block([timer, finished] { return finished(timer); }, std::nullopt);
+	});
+	registry.add("CloseThreadpoolTimer", 1, [&objects](ApiCall &call) {
+		const auto timer = objects.object_as<QueueTimer>(call[0]);
+		if (!timer || !timer->instance)
+			return;
+		timer->active = false;
+		timer->closed = true;
+		objects.close(call[0]);
+	});
 }
 
 }

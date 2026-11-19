@@ -3,6 +3,7 @@
 #include "child_process.h"
 #include "objects.h"
 
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -31,9 +32,14 @@ public:
 		return true;
 	}
 	bool empty() const { return packets.empty(); }
+	// Its last handle closed: the threads that wait on it give up (ERROR_ABANDONED_WAIT_0), and the packets still queued are gone.
+	bool watches_last_handle() const override { return true; }
+	void last_handle_closed() override { abandoned = true; packets.clear(); }
+	bool closed() const { return abandoned; }
 
 private:
 	std::deque<CompletionPacket> packets;
+	bool abandoned = false;
 };
 
 // Operations that were started and cannot finish yet. Each one is asked again whenever the process looks for completions, and drops out
@@ -68,6 +74,16 @@ public:
 		added.clear();
 		return finished;
 	}
+	// The same for a waiting thread's condition, which is looked at after every call another thread makes: trying every operation again,
+	// each a system call, then cost more than the calls themselves. A descriptor that became ready waits a fraction of a millisecond.
+	bool look()
+	{
+		const auto now = std::chrono::steady_clock::now();
+		if (operations.empty() || now - looked < std::chrono::microseconds(200))
+			return false;
+		looked = now;
+		return poll();
+	}
 	size_t pending() const { return operations.size() + added.size(); }
 	// The descriptors pending operations wait on.
 	void watch(std::vector<pollfd> &descriptors) const
@@ -85,6 +101,7 @@ private:
 	};
 	std::vector<std::pair<Pending, std::unique_ptr<HostWait>>> operations, added;
 	bool polling = false;
+	std::chrono::steady_clock::time_point looked;
 };
 
 }

@@ -14,13 +14,17 @@ typedef INT UErrorCode;
 typedef signed char UBool;
 
 #define U_ZERO_ERROR 0
+#define U_USING_FALLBACK_WARNING (-128)
+#define U_USING_DEFAULT_WARNING (-127)
 #define U_STRING_NOT_TERMINATED_WARNING (-124)
 #define U_ILLEGAL_ARGUMENT_ERROR 1
+#define U_MISSING_RESOURCE_ERROR 2
 #define U_MEMORY_ALLOCATION_ERROR 7
 #define U_INDEX_OUTOFBOUNDS_ERROR 8
 #define U_INVALID_CHAR_FOUND 10
 #define U_BUFFER_OVERFLOW_ERROR 15
 #define U_UNSUPPORTED_ERROR 16
+#define U_INVALID_STATE_ERROR 27
 #define U_REGEX_RULE_SYNTAX 0x10301
 #define U_REGEX_INVALID_STATE 0x10302
 #define U_REGEX_BAD_ESCAPE_SEQUENCE 0x10303
@@ -63,6 +67,11 @@ INT icu_utext_units(const UText *text, INT64 native);
 INT64 icu_utext_native(const UText *text, INT units);
 UText *icu_utext_copy(const UText *text);
 
+/* The one locale the system describes, and whether a name, in ICU's or the system's form, falls back to it. */
+BOOL icu_known_locale(const char *name);
+
 UText *__cdecl utext_openUChars(UText *reuse, const UChar *text, INT64 length, UErrorCode *status);
 UText *__cdecl utext_close(UText *text);
+INT __cdecl u_strToLower(UChar *dest, INT capacity, const UChar *source, INT length, const char *locale, UErrorCode *status);
+INT __cdecl u_strToUpper(UChar *dest, INT capacity, const UChar *source, INT length, const char *locale, UErrorCode *status);
 #endif

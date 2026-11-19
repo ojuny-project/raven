@@ -16,7 +16,8 @@ int raven_entry(void)
 	lstrcpyW(file, directory);
 	lstrcatW(file, L"raven-folder-test.txt");
 	HANDLE handle = CreateFileW(file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-	if (handle == INVALID_HANDLE_VALUE)
+	DWORD written = 0;
+	if (handle == INVALID_HANDLE_VALUE || !WriteFile(handle, "raven", 5, &written, NULL) || written != 5)
 		return 2;
 	CloseHandle(handle);
 
@@ -123,6 +124,106 @@ int raven_entry(void)
 	PITEMID_CHILD first = ILCloneFirst((PCUIDLIST_RELATIVE)joined);
 	if (!first || ILIsEqual((PCIDLIST_ABSOLUTE)first, joined) || first->mkid.cb != folder_list->mkid.cb)
 		return 21;
+
+	/* The list of an existing path by name, as WinForms asks for the folder its file dialogs start in, and a missing path refused. */
+	HRESULT (WINAPI *create_list)(PCWSTR, PIDLIST_ABSOLUTE *, DWORD *) =
+		(HRESULT (WINAPI *)(PCWSTR, PIDLIST_ABSOLUTE *, DWORD *))(void (*)(void))GetProcAddress(GetModuleHandleW(L"shell32.dll"), "SHILCreateFromPath");
+	PIDLIST_ABSOLUTE created = NULL;
+	DWORD wanted = SFGAO_FOLDER | SFGAO_STREAM;
+	if (!create_list || create_list(directory, &created, &wanted) != S_OK || !created || wanted != SFGAO_FOLDER ||
+		!SHGetPathFromIDListW(created, parsed) || lstrcmpiW(parsed, directory) && (lstrlenW(parsed) + 1 != lstrlenW(directory)))
+		return 29;
+	/* The item of that list, as the dialog then makes it, gives the folder back. */
+	HRESULT (WINAPI *create_item)(PCIDLIST_ABSOLUTE, IShellFolder *, PCUITEMID_CHILD, IShellItem **) =
+		(HRESULT (WINAPI *)(PCIDLIST_ABSOLUTE, IShellFolder *, PCUITEMID_CHILD, IShellItem **))(void (*)(void))GetProcAddress(
+			GetModuleHandleW(L"shell32.dll"), "SHCreateShellItem");
+	IShellItem *shell_item = NULL;
+	WCHAR *item_path = NULL;
+	if (!create_item || create_item(NULL, NULL, (PCUITEMID_CHILD)created, &shell_item) != S_OK || !shell_item ||
+		IShellItem_GetDisplayName(shell_item, SIGDN_FILESYSPATH, &item_path) != S_OK || !SHGetPathFromIDListW(created, parsed) ||
+		lstrcmpiW(item_path, parsed))
+		return 31;
+	CoTaskMemFree(item_path);
+	IShellItem_Release(shell_item);
+	ILFree((PIDLIST_RELATIVE)created);
+	created = (PIDLIST_ABSOLUTE)1;
+	if (create_list(missing, &created, NULL) != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || created)
+		return 30;
+	/* The same by display name, as Mp3tag finds the folder it starts in, with the attributes asked for; a missing path is refused. */
+	HRESULT (WINAPI *parse_name)(PCWSTR, IBindCtx *, PIDLIST_ABSOLUTE *, SFGAOF, SFGAOF *) =
+		(HRESULT (WINAPI *)(PCWSTR, IBindCtx *, PIDLIST_ABSOLUTE *, SFGAOF, SFGAOF *))(void (*)(void))GetProcAddress(
+			GetModuleHandleW(L"shell32.dll"), "SHParseDisplayName");
+	SFGAOF found = 0;
+	if (!parse_name || parse_name(directory, NULL, &created, SFGAO_FOLDER | SFGAO_STREAM, &found) != S_OK || !created ||
+		found != SFGAO_FOLDER || !SHGetPathFromIDListW(created, parsed) || lstrcmpiW(parsed, directory) && (lstrlenW(parsed) + 1 != lstrlenW(directory)))
+		return 32;
+	ILFree((PIDLIST_RELATIVE)created);
+	created = (PIDLIST_ABSOLUTE)1;
+	if (SUCCEEDED(parse_name(missing, NULL, &created, 0, NULL)) || created)
+		return 33;
+	/* The folder that holds the last item of a list, and that item, which names the file in it. */
+	HRESULT (WINAPI *bind_parent)(PCIDLIST_ABSOLUTE, REFIID, void **, PCUITEMID_CHILD *) =
+		(HRESULT (WINAPI *)(PCIDLIST_ABSOLUTE, REFIID, void **, PCUITEMID_CHILD *))(void (*)(void))GetProcAddress(
+			GetModuleHandleW(L"shell32.dll"), "SHBindToParent");
+	IShellFolder *parent = NULL;
+	PCUITEMID_CHILD named = NULL;
+	if (!bind_parent || bind_parent(joined, &IID_IShellFolder, (void **)&parent, &named) != S_OK || !parent || named != last)
+		return 34;
+	if (IShellFolder_GetDisplayNameOf(parent, named, SHGDN_FORPARSING, &text) != S_OK || text.uType != STRRET_WSTR || lstrcmpiW(text.pOleStr, file))
+		return 35;
+	CoTaskMemFree(text.pOleStr);
+	IShellFolder_Release(parent);
+	/* What a directory listing says of an item, as Mp3tag reads it of each file it shows. */
+	HRESULT (WINAPI *item_data)(IShellFolder *, PCUITEMID_CHILD, int, void *, int) =
+		(HRESULT (WINAPI *)(IShellFolder *, PCUITEMID_CHILD, int, void *, int))(void (*)(void))GetProcAddress(
+			GetModuleHandleW(L"shell32.dll"), "SHGetDataFromIDListW");
+	WIN32_FIND_DATAW data;
+	if (!item_data || item_data(folder, (PCUITEMID_CHILD)child, SHGDFIL_FINDDATA, &data, sizeof data) != S_OK ||
+		lstrcmpiW(data.cFileName, name) || data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+		return 36;
+	if (item_data(folder, (PCUITEMID_CHILD)child, SHGDFIL_FINDDATA, &data, sizeof data - 1) != E_INVALIDARG)
+		return 37;
+
+	/* The item of a file answers IShellItem2 with what the file system keeps for it, and a property it does not have is refused. */
+	static const PROPERTYKEY size_key = {{0xb725f130, 0x47ef, 0x101a, {0xa5, 0xf1, 0x02, 0x60, 0x8c, 0x9e, 0xeb, 0xac}}, 12};
+	static const PROPERTYKEY modified_key = {{0xb725f130, 0x47ef, 0x101a, {0xa5, 0xf1, 0x02, 0x60, 0x8c, 0x9e, 0xeb, 0xac}}, 14};
+	IShellItem2 *item2 = NULL;
+	ULONGLONG size = 0;
+	FILETIME modified = {0, 0};
+	WCHAR *display = NULL;
+	ULONG unknown = 0;
+	if (SHCreateItemFromParsingName(file, NULL, &IID_IShellItem2, (void **)&item2) != S_OK || !item2)
+		return 38;
+	if (IShellItem2_GetUInt64(item2, &size_key, &size) != S_OK || size != 5)
+		return 39;
+	if (IShellItem2_GetFileTime(item2, &modified_key, &modified) != S_OK || !modified.dwHighDateTime)
+		return 40;
+	if (IShellItem2_GetString(item2, &name_key, &display) != S_OK || lstrcmpiW(display, name))
+		return 41;
+	CoTaskMemFree(display);
+	if (SUCCEEDED(IShellItem2_GetUInt32(item2, &unknown_key, &unknown)) || IShellItem2_Update(item2, NULL) != S_OK)
+		return 42;
+	store = NULL;
+	if (IShellItem2_GetPropertyStore(item2, GPS_DEFAULT, &IID_IPropertyStore, (void **)&store) != S_OK ||
+		IPropertyStore_GetValue(store, &size_key, &value) != S_OK || value.vt != VT_UI8 || value.uhVal.QuadPart != 5)
+		return 43;
+	IPropertyStore_Release(store);
+	IShellItem2_Release(item2);
+	/* The same for the folder, as WPF's file dialogs ask of the folder they start in. */
+	if (SHCreateItemFromParsingName(directory, NULL, &IID_IShellItem2, (void **)&item2) != S_OK || !item2)
+		return 44;
+	IShellItem2_Release(item2);
+	/* The save dialog names the window its prompts belong to only while it is shown. */
+	IFileSaveDialog *save = NULL;
+	IOleWindow *window = NULL;
+	HWND owner = (HWND)1;
+	CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+	if (CoCreateInstance(&CLSID_FileSaveDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileSaveDialog, (void **)&save) != S_OK || !save)
+		return 45;
+	if (IFileSaveDialog_QueryInterface(save, &IID_IOleWindow, (void **)&window) != S_OK || IOleWindow_GetWindow(window, &owner) != E_FAIL || owner)
+		return 46;
+	IOleWindow_Release(window);
+	IFileSaveDialog_Release(save);
 
 	ILFree((PIDLIST_RELATIVE)first);
 	ILFree(clone);

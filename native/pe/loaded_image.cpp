@@ -77,7 +77,10 @@ void LoadedImage::relocate(const PEImage &image)
 {
 	const auto directory = image.directories[5];
 	if ((image.characteristics & 1) || !directory.address || !directory.size) {
-		// A library of resources alone, with no code to run, no imports and no thread data, holds no address to fix: it works anywhere.
+		// An image that does not say its relocations were stripped and carries none has no address to fix, as on Windows; nor has a
+		// library of resources alone, with no code to run, no imports and no thread data.
+		if (!(image.characteristics & 1))
+			return;
 		if (!image.entry && !image.directories[1].address && !image.directories[9].address && !image.directories[13].address)
 			return;
 		throw std::runtime_error("PE image has no relocation table for the requested base");
@@ -219,6 +222,46 @@ std::vector<ImageMapping> LoadedImage::mappings() const
 			result.push_back({address + offset, length, offset, protections[page]});
 	}
 	return result;
+}
+
+void LoadedImage::detach()
+{
+	if (fd < 0)
+		return;
+	const int copy = memfd_create("raven-image", MFD_CLOEXEC);
+	if (copy < 0)
+		throw std::system_error(errno, std::generic_category(), "create PE backing file");
+	try {
+		if (ftruncate(copy, static_cast<off_t>(size)) != 0)
+			throw std::system_error(errno, std::generic_category(), "size PE backing file");
+		// Only what was written is copied: the rest of an image is holes that read as zeros, which a copy of every byte would fill.
+		for (off_t at = 0; at < off_t(size);) {
+			const off_t data = lseek(fd, at, SEEK_DATA);
+			if (data < 0)
+				break;
+			const off_t hole = std::min<off_t>(lseek(fd, data, SEEK_HOLE), off_t(size));
+			// The kernel copies file to file without the pages being faulted into this process; a kernel that cannot copies through it.
+			for (off_t done = data; done < hole;) {
+				loff_t from = done, to = done;
+				auto written = copy_file_range(fd, &from, copy, &to, size_t(hole - done), 0);
+				if (written <= 0 && errno != EINTR)
+					written = pwrite(copy, storage + done, size_t(hole - done), done);
+				if (written < 0 && errno == EINTR)
+					continue;
+				if (written <= 0)
+					throw std::system_error(errno, std::generic_category(), "fill PE backing file");
+				done += written;
+			}
+			at = hole;
+		}
+		if (mmap(storage, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, copy, 0) == MAP_FAILED)
+			throw std::system_error(errno, std::generic_category(), "map PE backing file");
+	} catch (...) {
+		close(copy);
+		throw;
+	}
+	close(fd);
+	fd = copy;
 }
 
 int LoadedImage::descriptor() const { return fd; }

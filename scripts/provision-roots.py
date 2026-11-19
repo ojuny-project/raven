@@ -8,21 +8,14 @@ usage: provision-roots.py --output DIRECTORY
 """
 
 import argparse
-import hashlib
+import re
 from pathlib import Path
-import urllib.request
 
-# The certificate, where Microsoft publishes it, and the SHA-256 of its DER bytes.
-ROOTS = (
-    ("MicrosoftRootAuthority.crt", "http://www.microsoft.com/pki/certs/MicrosoftRootAuthority.crt",
-     "f38406e540d7a9d90cb4a9479299640ffb6df9e224ecc7a01c0d9558d8dad77d"),
-    ("MicrosoftRootCert.crt", "http://www.microsoft.com/pki/certs/MicrosoftRootCert.crt",
-     "885de64c340e3ea70658f01e1145f957fcda27aabeea1ab9faa9fdb0102d4077"),
-    ("MicRooCerAut_2010-06-23.crt", "http://www.microsoft.com/pki/certs/MicRooCerAut_2010-06-23.crt",
-     "df545bf919a2439c36983b54cdfc903dfa4f37d3996d8d84b4c31eec6f3c163e"),
-    ("MicRooCerAut2011_2011_03_22.crt", "http://www.microsoft.com/pki/certs/MicRooCerAut2011_2011_03_22.crt",
-     "847df6a78497943f27fc72eb93f9a637320a02b561d0a91b09e87a7807ed7c61"),
-)
+import downloads
+
+# The certificates, where Microsoft publishes each and the SHA-256 of its DER bytes, from the table the runtime downloads them by.
+TABLE = Path(__file__).resolve().parent.parent / "native/nt/code_signing_roots.inc"
+ROOTS = tuple(re.findall(r'^\{"([^"]+)", "([^"]+)", "([0-9a-f]{64})"\},$', TABLE.read_text(), re.M))
 
 
 def main():
@@ -31,13 +24,7 @@ def main():
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     for name, url, digest in ROOTS:
-        target = args.output / name
-        if not target.exists() or hashlib.sha256(target.read_bytes()).hexdigest() != digest:
-            with urllib.request.urlopen(url) as response:
-                data = response.read()
-            if hashlib.sha256(data).hexdigest() != digest:
-                raise RuntimeError(f"{name} differs from the pinned certificate")
-            target.write_bytes(data)
+        downloads.fetch(url, args.output / name, digest, f"certificate {name}", replace=True)
     print(f"roots in {args.output}")
 
 

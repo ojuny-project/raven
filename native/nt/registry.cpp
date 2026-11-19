@@ -1,5 +1,7 @@
 #include "registry.h"
 
+#include "apps.h"
+
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -7,6 +9,8 @@
 #include "nls.h"
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <fstream>
 #include <initializer_list>
 #include <stdexcept>
@@ -39,6 +43,7 @@ std::u16string fold(std::u16string_view text)
 std::u16string decode_utf8(std::string_view text)
 {
 	std::u16string result;
+	result.reserve(text.size());
 	for (size_t index = 0; index < text.size();) {
 		const auto lead = static_cast<unsigned char>(text[index]);
 		const size_t extra = lead < 0x80 ? 0 : lead < 0xe0 ? 1 : lead < 0xf0 ? 2 : 3;
@@ -79,9 +84,9 @@ std::vector<uint8_t> unhex(std::string_view text)
 		if (c >= 'a' && c <= 'f') return uint8_t(c - 'a' + 10);
 		throw std::runtime_error("registry hive contains invalid hexadecimal data");
 	};
-	std::vector<uint8_t> result;
+	std::vector<uint8_t> result(text.size() / 2);
 	for (size_t index = 0; index < text.size(); index += 2)
-		result.push_back(uint8_t(nibble(text[index]) << 4 | nibble(text[index + 1])));
+		result[index / 2] = uint8_t(nibble(text[index]) << 4 | nibble(text[index + 1]));
 	return result;
 }
 
@@ -102,6 +107,7 @@ std::string escape(std::u16string_view text)
 std::string unescape(std::string_view text)
 {
 	std::string result;
+	result.reserve(text.size());
 	for (size_t index = 0; index < text.size(); ++index) {
 		if (text[index] != '\\') {
 			result.push_back(text[index]);
@@ -124,6 +130,11 @@ NativeRegistry::NativeRegistry(std::filesystem::path file) : file(std::move(file
 	register_runtime_classes();
 	register_event_logs();
 	register_system_environment();
+	// The hive of the prefix an installed program runs in: what the program changes outside its own keys goes to its layer.
+	const auto &layer = app_layer();
+	if (layer.active() && std::filesystem::absolute(this->file).lexically_normal() == layer.prefix_root() / "registry.dat")
+		set_layer(layer.registry(), [&layer](std::u16string_view folded) { return layer.owns_key(folded); },
+			[&layer](std::u16string_view folded) { layer.claim_key(folded); });
 }
 
 // The classes Windows registers in both registry views whose libraries the runtime brings: the .NET runtime's metadata dispensers, runtime
@@ -133,8 +144,9 @@ NativeRegistry::NativeRegistry(std::filesystem::path file) : file(std::move(file
 // which programs ask whether they are online, the package manager of the Windows Runtime, the factories of the packaging API, which
 // package managers read .appx and .msix packages with, the background transfer manager of each BITS version, which bootstrappers
 // download through, the locator and object path parser of management instrumentation, which System.Management asks what the
-// machine is made of through, the WebBrowser control, which Windows Forms and WPF programs embed, and the marshaler of interfaces a
-// type library describes, which their ProxyStubClsid32 names. A hive that lacks them, a new one or one made before they were registered, gets them.
+// machine is made of through, the WebBrowser control, which Windows Forms and WPF programs embed, the marshaler of interfaces a
+// type library describes, which their ProxyStubClsid32 names, and the audio device enumerator and the DirectSound classes programs
+// play sound through. A hive that lacks them, a new one or one made before they were registered, gets them.
 void NativeRegistry::register_runtime_classes()
 {
 	static constexpr std::pair<const char16_t *, const char16_t *> classes[] = {{u"{E5CB7A31-7512-11D2-89CE-0080C792E5D8}", u"mscoree.dll"},
@@ -156,7 +168,11 @@ void NativeRegistry::register_runtime_classes()
 		{u"{EE09B103-97E0-11CF-978F-00A02463E06F}", u"scrrun.dll"}, {u"{0D43FE01-F093-11CF-8940-00A0C9054228}", u"scrrun.dll"},
 		{u"{72C24DD5-D70A-438B-8A42-98424B88AFB8}", u"wshom.ocx"}, {u"{093FF999-1EA0-4079-9525-9614C3504B74}", u"wshom.ocx"},
 		{u"{F935DC22-1CF0-11D0-ADB9-00C04FD58A0B}", u"wshom.ocx"}, {u"{F935DC26-1CF0-11D0-ADB9-00C04FD58A0B}", u"wshom.ocx"},
-		{u"{F414C260-6AC0-11CF-B6D1-00AA00BBBB58}", u"jscript.dll"}, {u"{00020424-0000-0000-C000-000000000046}", u"oleaut32.dll"}};
+		{u"{F414C260-6AC0-11CF-B6D1-00AA00BBBB58}", u"jscript.dll"}, {u"{00020424-0000-0000-C000-000000000046}", u"oleaut32.dll"},
+		{u"{BCDE0395-E52F-467C-8E3D-C4579291692E}", u"mmdevapi.dll"}, {u"{F447B69E-1884-4A7E-8055-346F74D6EDB3}", u"resampledmo.dll"},
+		{u"{47D4D946-62E8-11CF-93BC-444553540000}", u"dsound.dll"},
+		{u"{3901CC3F-84B5-4FA4-BA35-AA8172B8A09B}", u"dsound.dll"}, {u"{B0210780-89CD-11D0-AF08-00A0C925CD16}", u"dsound.dll"},
+		{u"{E4BCAC13-7F99-4908-9A8E-74E3BF24B6E1}", u"dsound.dll"}, {u"{FEA4300C-7959-4147-B26A-2377B9E7A91D}", u"dsound.dll"}};
 	register_animation_classes();
 	const auto store = [&](uint64_t key, const char16_t *name, std::u16string_view value) {
 		std::vector<uint8_t> data;
@@ -229,10 +245,14 @@ void NativeRegistry::register_runtime_classes()
 	// The Windows Runtime classes the runtime brings, in-process (activation type 0) and callable from any apartment (threading 0):
 	// installers ask the package manager whether a packaged version of what they install is present, and Office asks the UI settings
 	// for the theme's colours and the text scale while it starts, along with the network, the device's profile, the system's accounts
-	// and the application model; programs ask the analytics information which Windows they run on and make HTTP requests to the URIs they go to.
+	// and the application model; programs ask the analytics information which Windows they run on and make HTTP requests to the URIs they go to,
+	// and post work to the dispatcher queue of a thread.
 	static constexpr std::pair<const char16_t *, const char16_t *> runtime_classes[] = {
+		{u"Windows.System.DispatcherQueue", u"coremessaging.dll"}, {u"Windows.System.DispatcherQueueController", u"coremessaging.dll"},
 		{u"Windows.Management.Deployment.PackageManager", u"raven-deployment.dll"},
 		{u"Windows.UI.ViewManagement.UISettings", u"raven-uisettings.dll"},
+		{u"Windows.UI.Composition.Compositor", u"dcomp.dll"},
+		{u"Windows.UI.Composition.Core.CompositorController", u"dcomp.dll"},
 		{u"Windows.Globalization.Language", u"raven-twinapi.dll"},
 		{u"Windows.System.Profile.RetailInfo", u"raven-twinapi.dll"}, {u"Windows.System.Profile.SharedModeSettings", u"raven-twinapi.dll"},
 		{u"Windows.System.Profile.AnalyticsInfo", u"raven-twinapi.dll"},
@@ -539,6 +559,7 @@ bool NativeRegistry::resolve(uint64_t parent, std::u16string_view path, std::u16
 
 uint32_t NativeRegistry::create(uint64_t parent, std::u16string_view path, uint64_t &key, uint32_t &disposition)
 {
+	const std::lock_guard guarded(guard);
 	refresh();
 	std::u16string folded, display;
 	if (!resolve(parent, path, folded, display))
@@ -551,10 +572,13 @@ uint32_t NativeRegistry::create(uint64_t parent, std::u16string_view path, uint6
 	// Every ancestor exists once a key does, so enumeration of parents stays consistent.
 	std::string records;
 	size_t end = 0;
+	std::u16string made;
 	while (end != folded.npos) {
 		end = folded.find(u'\\', end + 1);
 		const auto partial = folded.substr(0, end);
 		if (!keys.contains(partial)) {
+			if (made.empty())
+				made = partial;
 			keys.emplace(partial, Key{display.substr(0, end), {}});
 			records += "K\t" + escape(display.substr(0, end)) + '\n';
 			if (partial == folded)
@@ -565,13 +589,17 @@ uint32_t NativeRegistry::create(uint64_t parent, std::u16string_view path, uint6
 	if (!key)
 		return 8;
 	open_keys.emplace(key, folded);
+	// A key made where none was belongs to the program that made it, and goes to the shared hive.
+	if (!made.empty() && layer_claim && !layer_owns(made))
+		layer_claim(made);
 	if (!records.empty())
-		journal(records);
+		journal(records, folded);
 	return 0;
 }
 
 uint32_t NativeRegistry::open(uint64_t parent, std::u16string_view path, uint64_t &key)
 {
+	const std::lock_guard guarded(guard);
 	refresh();
 	std::u16string folded, display;
 	if (!resolve(parent, path, folded, display))
@@ -589,6 +617,7 @@ uint32_t NativeRegistry::open(uint64_t parent, std::u16string_view path, uint64_
 
 uint32_t NativeRegistry::override_root(uint64_t root, uint64_t key)
 {
+	const std::lock_guard guarded(guard);
 	if (!predefined(root))
 		return bad_handle;
 	if (!key) {
@@ -604,6 +633,7 @@ uint32_t NativeRegistry::override_root(uint64_t root, uint64_t key)
 
 uint32_t NativeRegistry::close(uint64_t key)
 {
+	const std::lock_guard guarded(guard);
 	if (predefined(key))
 		return 0;
 	if (!open_keys.erase(key))
@@ -615,6 +645,7 @@ uint32_t NativeRegistry::close(uint64_t key)
 
 uint32_t NativeRegistry::query(uint64_t key, std::u16string_view name, uint32_t &type, std::vector<uint8_t> &data) const
 {
+	const std::lock_guard guarded(guard);
 	refresh();
 	const auto found = open_keys.find(key);
 	if (found == open_keys.end())
@@ -630,6 +661,7 @@ uint32_t NativeRegistry::query(uint64_t key, std::u16string_view name, uint32_t 
 
 uint32_t NativeRegistry::set(uint64_t key, std::u16string_view name, uint32_t type, std::span<const uint8_t> data)
 {
+	const std::lock_guard guarded(guard);
 	refresh();
 	const auto found = open_keys.find(key);
 	if (found == open_keys.end())
@@ -641,7 +673,7 @@ uint32_t NativeRegistry::set(uint64_t key, std::u16string_view name, uint32_t ty
 	auto &target = keys.at(found->second);
 	target.values[fold(name)] = Value{std::u16string(name), type, std::vector<uint8_t>(data.begin(), data.end())};
 	journal("V\t" + escape(target.path) + '\t' + escape(std::u16string(name)) + '\t' + std::to_string(type) + '\t' +
-		hex(std::vector<uint8_t>(data.begin(), data.end())) + '\n');
+		hex(std::vector<uint8_t>(data.begin(), data.end())) + '\n', found->second);
 	return 0;
 }
 
@@ -657,6 +689,7 @@ std::vector<std::u16string> NativeRegistry::children(const std::u16string &folde
 
 uint32_t NativeRegistry::remove_key(uint64_t parent, std::u16string_view path)
 {
+	const std::lock_guard guarded(guard);
 	refresh();
 	std::u16string folded, display;
 	if (!resolve(parent, path, folded, display))
@@ -674,12 +707,13 @@ uint32_t NativeRegistry::remove_key(uint64_t parent, std::u16string_view path)
 	for (auto &[handle, target] : open_keys)
 		if (target == folded)
 			target.clear();
-	journal("X\t" + escape(shown) + "\t1\n");
+	journal("X\t" + escape(shown) + "\t1\n", folded);
 	return 0;
 }
 
 uint32_t NativeRegistry::remove_tree(uint64_t parent, std::u16string_view path)
 {
+	const std::lock_guard guarded(guard);
 	refresh();
 	std::u16string folded, display;
 	if (!resolve(parent, path, folded, display))
@@ -697,12 +731,13 @@ uint32_t NativeRegistry::remove_tree(uint64_t parent, std::u16string_view path)
 	for (auto &[handle, target] : open_keys)
 		if ((target == folded && !path.empty()) || target.starts_with(prefix))
 			target.clear();
-	journal("X\t" + escape(shown) + (path.empty() ? "\t0\n" : "\t1\n"));
+	journal("X\t" + escape(shown) + (path.empty() ? "\t0\n" : "\t1\n"), folded);
 	return 0;
 }
 
 uint32_t NativeRegistry::remove_value(uint64_t key, std::u16string_view name)
 {
+	const std::lock_guard guarded(guard);
 	refresh();
 	const auto found = open_keys.find(key);
 	if (found == open_keys.end())
@@ -712,12 +747,13 @@ uint32_t NativeRegistry::remove_value(uint64_t key, std::u16string_view name)
 		return key_deleted;
 	if (!entry->second.values.erase(fold(name)))
 		return file_not_found;
-	journal("Y\t" + escape(entry->second.path) + '\t' + escape(std::u16string(name)) + '\n');
+	journal("Y\t" + escape(entry->second.path) + '\t' + escape(std::u16string(name)) + '\n', entry->first);
 	return 0;
 }
 
 uint32_t NativeRegistry::enum_key(uint64_t key, uint32_t index, std::u16string &name) const
 {
+	const std::lock_guard guarded(guard);
 	refresh();
 	std::u16string folded;
 	if (predefined(key)) {
@@ -741,6 +777,7 @@ uint32_t NativeRegistry::enum_key(uint64_t key, uint32_t index, std::u16string &
 
 uint32_t NativeRegistry::enum_value(uint64_t key, uint32_t index, std::u16string &name, uint32_t &type, std::vector<uint8_t> &data) const
 {
+	const std::lock_guard guarded(guard);
 	refresh();
 	const auto found = open_keys.find(key);
 	if (found == open_keys.end())
@@ -760,6 +797,7 @@ uint32_t NativeRegistry::enum_value(uint64_t key, uint32_t index, std::u16string
 
 uint32_t NativeRegistry::info(uint64_t key, Info &result) const
 {
+	const std::lock_guard guarded(guard);
 	refresh();
 	std::u16string folded, shown;
 	if (predefined(key)) {
@@ -789,10 +827,10 @@ uint32_t NativeRegistry::info(uint64_t key, Info &result) const
 	return 0;
 }
 
-NativeRegistry::Stamp NativeRegistry::current_stamp() const
+NativeRegistry::Stamp NativeRegistry::stamp_of(const std::filesystem::path &path)
 {
 	struct stat status{};
-	if (file.empty() || ::stat(file.c_str(), &status))
+	if (path.empty() || ::stat(path.c_str(), &status))
 		return {};
 	return {status.st_mtim.tv_sec, status.st_mtim.tv_nsec, status.st_size, static_cast<long long>(status.st_ino)};
 }
@@ -803,17 +841,21 @@ void NativeRegistry::refresh() const
 	if (file.empty() || seeding)
 		return;
 	const auto now = current_stamp();
-	if (now == stamp)
+	const auto layer_now = stamp_of(layer_file);
+	if (now == stamp && layer_now == layer_stamp)
 		return;
 	auto &self = const_cast<NativeRegistry &>(*this);
-	// Records appended to the same file are read from where reading stopped; a file written again whole is read from its start.
+	// Records appended to the same file are read from where reading stopped; a file written again whole is read from its start. The
+	// layer is read again whole after them, as what it holds stands over everything the shared hive says.
 	if (now.inode == stamp.inode && now.size >= loaded && loaded > 0)
 		self.replay(loaded);
 	else {
 		self.keys.clear();
 		self.load();
 	}
+	self.replay_layer();
 	stamp = now;
+	layer_stamp = layer_now;
 }
 
 void NativeRegistry::save() const
@@ -840,10 +882,30 @@ void NativeRegistry::save() const
 	loaded = compacted = stamp.size;
 }
 
-void NativeRegistry::journal(const std::string &records)
+void NativeRegistry::journal(const std::string &records, std::u16string_view folded)
 {
 	if (file.empty() || seeding)
 		return;
+	if (!layer_file.empty() && !layer_owns(folded)) {
+		// The layer is the program's own; it is read again whole, with whatever another process of the program appended to it.
+		std::filesystem::create_directories(layer_file.parent_path());
+		const int descriptor = ::open(layer_file.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+		if (descriptor < 0)
+			throw std::runtime_error("cannot write the registry layer");
+		::flock(descriptor, LOCK_EX);
+		size_t written = 0;
+		while (written < records.size()) {
+			const auto done = ::write(descriptor, records.data() + written, records.size() - written);
+			if (done <= 0)
+				break;
+			written += size_t(done);
+		}
+		::flock(descriptor, LOCK_UN);
+		::close(descriptor);
+		if (written != records.size())
+			throw std::runtime_error("cannot write the registry layer");
+		return;
+	}
 	// A process that compacts the hive renames a new file over it, so the file locked must still be the one the path names.
 	int descriptor = -1;
 	struct stat opened{};
@@ -874,12 +936,49 @@ void NativeRegistry::journal(const std::string &records)
 	}
 	replay(loaded);
 	stamp = current_stamp();
-	if (written == records.size() && stamp.size > 4 * 1024 * 1024 && stamp.size > 3 * compacted)
+	if (written == records.size() && layer_file.empty() && stamp.size > 4 * 1024 * 1024 && stamp.size > 3 * compacted)
 		save();
 	::flock(descriptor, LOCK_UN);
 	::close(descriptor);
 	if (written != records.size())
 		throw std::runtime_error("cannot write the registry hive");
+}
+
+void NativeRegistry::replay_layer()
+{
+	if (layer_file.empty())
+		return;
+	std::ifstream input(layer_file, std::ios::binary);
+	std::string line;
+	recent_path.clear();
+	while (std::getline(input, line) && !input.eof())
+		apply(line);
+}
+
+void NativeRegistry::set_layer(std::filesystem::path layer, std::function<bool(std::u16string_view)> owns,
+	std::function<void(std::u16string_view)> claim)
+{
+	const std::lock_guard guarded(guard);
+	layer_file = std::move(layer);
+	layer_owns = std::move(owns);
+	layer_claim = std::move(claim);
+	replay_layer();
+	layer_stamp = stamp_of(layer_file);
+}
+
+std::map<std::u16string, std::string> NativeRegistry::digest(const std::filesystem::path &file)
+{
+	NativeRegistry hive;
+	hive.file = file;
+	hive.load();
+	std::map<std::u16string, std::string> result;
+	for (const auto &[folded, key] : hive.keys) {
+		std::string values;
+		for (const auto &[name, value] : key.values)
+			values += escape(name) + '\t' + std::to_string(value.type) + '\t' + hex(value.data) + '\n';
+		result.emplace(folded, std::move(values));
+	}
+	return result;
 }
 
 void NativeRegistry::load()
@@ -895,6 +994,7 @@ long long NativeRegistry::replay(long long from)
 	input.seekg(from);
 	std::string line;
 	long long position = from;
+	recent_path.clear();
 	// Only whole lines count: a record another process is still writing is read the next time.
 	while (std::getline(input, line) && !input.eof()) {
 		position += (long long)line.size() + 1;
@@ -906,26 +1006,40 @@ long long NativeRegistry::replay(long long from)
 
 void NativeRegistry::apply(const std::string &line)
 {
-	std::vector<std::string> fields;
+	// The fields of the record, without copies; a record of more fields than any kind has is unknown.
+	std::array<std::string_view, 6> fields{};
+	size_t count = 0;
+	const std::string_view text(line);
 	size_t start = 0;
-	for (size_t tab; (tab = line.find('\t', start)) != line.npos; start = tab + 1)
-		fields.push_back(line.substr(start, tab - start));
-	fields.push_back(line.substr(start));
-	if (fields[0] == "K" && fields.size() == 2) {
+	for (size_t tab; count < fields.size() - 1 && (tab = text.find('\t', start)) != text.npos; start = tab + 1)
+		fields[count++] = text.substr(start, tab - start);
+	fields[count++] = text.substr(start);
+	const auto number = [](std::string_view digits) {
+		unsigned long value = 0;
+		if (std::from_chars(digits.data(), digits.data() + digits.size(), value).ec != std::errc())
+			throw std::runtime_error("registry hive contains an invalid value type");
+		return uint32_t(value);
+	};
+	if (fields[0] == "K" && count == 2) {
 		const auto path = decode_utf8(unescape(fields[1]));
-		keys.emplace(fold(path), Key{path, {}});
-	} else if (fields[0] == "V" && fields.size() == 5) {
-		const auto path = decode_utf8(unescape(fields[1]));
+		recent_key = keys.emplace(fold(path), Key{path, {}}).first;
+		recent_path = fields[1];
+	} else if (fields[0] == "V" && count == 5) {
 		const auto name = decode_utf8(unescape(fields[2]));
-		const auto found = keys.find(fold(path));
+		if (recent_path.empty() || recent_path != fields[1]) {
+			recent_key = keys.find(fold(decode_utf8(unescape(fields[1]))));
+			recent_path = fields[1];
+		}
+		const auto found = recent_key;
 		// A value set by a process that had not yet read another one's deletion of the key is lost with the key, as on Windows.
 		if (found != keys.end())
-			found->second.values[fold(name)] = Value{name, uint32_t(std::stoul(fields[3])), unhex(fields[4])};
-	} else if (fields[0] == "Y" && fields.size() == 3) {
+			found->second.values[fold(name)] = Value{name, number(fields[3]), unhex(fields[4])};
+	} else if (fields[0] == "Y" && count == 3) {
 		// A value deleted.
 		if (const auto found = keys.find(fold(decode_utf8(unescape(fields[1])))); found != keys.end())
 			found->second.values.erase(fold(decode_utf8(unescape(fields[2]))));
-	} else if (fields[0] == "X" && fields.size() == 3) {
+	} else if (fields[0] == "X" && count == 3) {
+		recent_path.clear();
 		// A key deleted with everything below it, or emptied ("0") when it stays.
 		const auto folded = fold(decode_utf8(unescape(fields[1])));
 		const auto prefix = folded + u'\\';

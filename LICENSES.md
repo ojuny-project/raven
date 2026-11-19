@@ -12,12 +12,13 @@ GPLv3 license applied to every file.
 | --- | --- |
 | Linux `raven` and `raven-bootstrap` | GPL-3.0-or-later; root LICENSE |
 | Original Raven PE adapters | MIT; exact file list in LICENSES.json and terms in LICENSES/MIT.txt |
-| PE installer components | Raven code under MIT with zlib, libxml2, libxslt, IJG JPEG and LibTIFF under their own notices; pinned releases, recipe and patches in `scripts/provision-installer.py` and `native/guest/raven-installer` |
+| PE installer components | Raven code under MIT with zlib, libxml2, libxslt, IJG JPEG, LibTIFF and Wuffs under their own notices; pinned releases, recipe and patches in `scripts/provision-installer.py` and `native/guest/raven-installer` |
 | CP1252 mapping data | Unicode-3.0; `native/upstream/windows-codepages/data-provenance.json` |
 | Code pages 1250, 1251 and 1253-1258 mapping data | Unicode-3.0; `native/upstream/windows-codepages/single-byte-provenance.json` |
 | Unicode decomposition data | Unicode terms; `native/upstream/unicode/LICENSE` and provenance.json |
 | libpng codec | PNG Reference Library License version 2; `native/upstream/libpng` |
 | Skia CPU backend | BSD-style terms and the notices of any compiled dependencies; `native/upstream/skia` |
+| OpenSSL, linked into the released `raven-runtime` | Apache-2.0; LICENSES/Apache-2.0.txt; unmodified release pinned in `scripts/provision-openssl.py` |
 | Liberation fonts, if bundled | SIL Open Font License 1.1; preserve the font package's copyright and license |
 | Raven Sans fonts, if bundled | Bitstream Vera and Arev font terms, DejaVu changes in the public domain; derived from DejaVu Sans Condensed 2.37 by `scripts/provision-text.py` under a name the terms permit; LICENSES/DejaVu-fonts.txt |
 | DXVK, if bundled | zlib license and upstream notices; pinned version in `native/graphics/backends.json` |

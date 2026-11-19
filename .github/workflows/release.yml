@@ -3,31 +3,69 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # The nightly pre-release comes from nightly.yml, out of the tree its CI built and tested. Asked for by hand, "nightly" here
+  # rebuilds main afresh instead.
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to build, such as v0.1.0
+        description: Existing tag to build, such as v0.1.0, or nightly for main as it is now
         required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
+  group: release-${{ inputs.tag || (github.event_name == 'schedule' && 'nightly') || github.ref_name }}
   cancel-in-progress: false
 
 env:
   COMPONENTS: /opt/ci/components
   BUILD: /opt/ci/build
   ARCHIVES: /opt/ci/archives
-  TAG: ${{ inputs.tag || github.ref_name }}
+  TAG: ${{ inputs.tag || (github.event_name == 'schedule' && 'nightly') || github.ref_name }}
 
 jobs:
-  # Provision: a release ships only components whose corresponding source travels with it (docs/packaging.md), so it
-  # provisions those afresh, with their source archives, instead of reusing the trimmed CI caches.
+  # Revision: the commit every later job checks out, so a nightly build stays on one commit even when main moves meanwhile.
+  # A scheduled night with no new commit on main since the published nightly builds nothing.
+
+  revision:
+    name: Resolve the revision
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - name: Resolve
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          build=true
+          if [ "${TAG}" = nightly ]; then
+            sha=$(gh api "repos/${GH_REPO}/commits/main" --jq .sha)
+            published=$(gh api "repos/${GH_REPO}/commits/nightly" --jq .sha 2>/dev/null || true)
+            if [ "${EVENT}" = schedule ] && [ "${sha}" = "${published}" ]; then
+              build=false
+            fi
+          else
+            sha=$(gh api "repos/${GH_REPO}/commits/${TAG}" --jq .sha)
+          fi
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+          echo "build=${build}" >> "${GITHUB_OUTPUT}"
+          echo "${TAG}: ${sha}, build ${build}"
+
+  # Provision: every component the complete suite builds with, afresh instead of from the trimmed CI caches. Those the
+  # release ships under terms that ask for their source come with it (docs/packaging.md).
 
   provision:
     name: Provision ${{ matrix.component }}
+    needs: revision
+    if: needs.revision.outputs.build == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 90
     container:
@@ -51,6 +89,21 @@ jobs:
           - component: installer32
             arguments: --arch x86 --output
             recipe: scripts/provision-installer.py
+          - component: sqlite
+            arguments: --output
+            recipe: scripts/provision-sqlite.py
+          - component: graphics
+            arguments: --destination
+            recipe: scripts/provision-graphics.py
+          - component: roots
+            arguments: --output
+            recipe: scripts/provision-roots.py
+          - component: libpng
+            arguments: --output
+            recipe: scripts/provision-libpng.py
+          - component: text
+            arguments: --jobs 4 --output
+            recipe: scripts/provision-text.py
           - component: testdata
             arguments: --output
             recipe: scripts/provision-fixtures.py
@@ -68,7 +121,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ needs.revision.outputs.sha }}
           persist-credentials: false
 
       - name: Install build packages
@@ -101,7 +154,7 @@ jobs:
 
   package:
     name: Build, test and bundle
-    needs: provision
+    needs: [revision, provision]
     runs-on: ubuntu-26.04
     timeout-minutes: 360
     container:
@@ -126,7 +179,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ needs.revision.outputs.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -151,14 +204,11 @@ jobs:
         run: python3 .github/scripts/release_materials.py "${COMPONENTS}" /opt/ci/materials.json
 
       - name: Configure
-        run: >
-          cmake -S . -B "${BUILD}" -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          -DRAVEN_RTL_COMPONENT_PATH="${COMPONENTS}/rtl/raven-rtl.dll"
-          -DRAVEN_CONTROLS_COMPONENT_DIR="${COMPONENTS}/controls"
-          -DRAVEN_CONTROLS32_COMPONENT_DIR="${COMPONENTS}/controls32"
-          -DRAVEN_INSTALLER_COMPONENT_DIR="${COMPONENTS}/installer"
-          -DRAVEN_INSTALLER32_COMPONENT_DIR="${COMPONENTS}/installer32"
-          -DRAVEN_TESTDATA_DIR="${COMPONENTS}/testdata"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t options < <(.github/scripts/components.sh options)
+          cmake -S . -B "${BUILD}" -DCMAKE_BUILD_TYPE=RelWithDebInfo "${options[@]}"
 
       - name: Prepare
         run: python3 scripts/package-native.py prepare --source "${GITHUB_WORKSPACE}" --build "${BUILD}"
@@ -174,25 +224,26 @@ jobs:
           ctest --test-dir "${BUILD}" --output-on-failure -j1 --timeout 1800
           --output-junit "${BUILD}/ctest-results.xml"
 
+      # package-native.py refuses to write inside the source tree it packages.
       - name: Bundle
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
+          mkdir -p /opt/ci/dist
           python3 scripts/package-native.py bundle \
             --source "${GITHUB_WORKSPACE}" --build "${BUILD}" \
             --test-report "${BUILD}/ctest-results.xml" \
             --materials /opt/ci/materials.json \
-            --output "dist/raven-${TAG}-linux-x86_64.tar.gz" \
-            --source-output "dist/raven-${TAG}-source.tar.gz"
-          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
-          cat dist/SHA256SUMS
+            --output "/opt/ci/dist/raven-${TAG}-linux-x86_64.tar.gz" \
+            --source-output "/opt/ci/dist/raven-${TAG}-source.tar.gz"
+          (cd /opt/ci/dist && sha256sum ./*.tar.gz > SHA256SUMS)
+          cat /opt/ci/dist/SHA256SUMS
 
       - name: Upload bundle
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release
-          path: dist/
+          path: /opt/ci/dist/
           retention-days: 30
           if-no-files-found: error
 
@@ -207,11 +258,12 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-  # Publish: a draft, so a maintainer reads the notes and publishes it by hand.
+  # Publish: a tag becomes a draft, so a maintainer reads the notes and publishes it by hand. The nightly build replaces the
+  # previous nightly pre-release at once, tag included, so its link always gives the newest build that passed the suite.
 
   publish:
-    name: Draft release
-    needs: package
+    name: Publish release
+    needs: [revision, package]
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
@@ -230,7 +282,22 @@ jobs:
         with:
           subject-path: dist/*.tar.gz
 
+      - name: Replace the nightly pre-release
+        if: env.TAG == 'nightly'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ needs.revision.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+          notes="Built from main at ${SHA} on $(date -u +%Y-%m-%d), after the complete test suite passed on it. "
+          notes+="This pre-release is replaced by the next night's build whenever main has changed."
+          gh release create nightly dist/* --prerelease --latest=false --target "${SHA}" --title "Nightly ${SHA:0:7}" --notes "${notes}"
+
       - name: Create the draft
+        if: env.TAG != 'nightly'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

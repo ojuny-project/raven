@@ -46,8 +46,14 @@ struct KernelContext {
 	// Top-level exception filter installed by the program (SetUnhandledExceptionFilter).
 	uint64_t unhandled_filter = 0;
 	bool shutdown_in_progress = false;
+	// Wakes the threads that wait on an address (WakeByAddressSingle with all false, WakeByAddressAll with it true) from a host thread
+	// that does not hold the turn, and tells whether one woke; the waiters are looked at again (set by the synchronization handlers).
+	std::function<bool(uint64_t, bool)> wake_address_beside;
 	// Delivers a CPU fault to the guest's handlers; never returns normally (it redirects or ends the process).
 	std::function<void(const NativeResult &)> raise_fault;
+	// At an API call made inside callbacks: ends those the guest has left without returning, and makes the call again at the nesting
+	// its stack belongs to (it then never returns).
+	std::function<void()> leave_abandoned_callbacks;
 	// Walks the guest stack with the unwind tables and names each caller as module+offset (diagnostics only).
 	std::function<std::string()> describe_stack;
 	// Current and new queue categories for a thread; the last argument clears the requested new bits.
@@ -60,6 +66,9 @@ struct KernelContext {
 	std::function<uint64_t(uint64_t, bool)> module_named;
 	// The environment variables the program has now, as the block a new process receives (set by the system handlers).
 	std::function<std::u16string()> environment_block;
+	// A certificate context for the first of these encoded certificates, its store a new memory store holding them all, as Schannel
+	// returns the chain a TLS peer sent; zero when it cannot be made (set by the crypt32 handlers).
+	std::function<uint64_t(ApiCall &, const std::vector<std::vector<uint8_t>> &)> certificate_with_store;
 	// Started operations that finish later, such as overlapped socket transfers.
 	std::shared_ptr<Reactor> reactor = std::make_shared<Reactor>();
 	// Named pipes served by this process and the pipe operations that have not finished.
@@ -80,7 +89,7 @@ void register_registry_api(ApiRegistry &registry, KernelContext &context, Native
 void apply_registry_settings(NativeRegistry &hive);
 void register_service_api(ApiRegistry &registry, KernelContext &context, NativeRegistry &hive);
 void register_platform_api(ApiRegistry &registry, KernelContext &context);
-void register_shell_api(ApiRegistry &registry, KernelContext &context);
+void register_shell_api(ApiRegistry &registry, KernelContext &context, NativeRegistry &hive);
 void register_version_api(ApiRegistry &registry, KernelContext &context);
 void register_shlwapi_api(ApiRegistry &registry, KernelContext &context);
 void register_file_api(ApiRegistry &registry, KernelContext &context);
@@ -117,15 +126,18 @@ void register_host_api(ApiRegistry &registry, KernelContext &context);
 void register_job_api(ApiRegistry &registry, KernelContext &context);
 // winmm wave output through the host sound server.
 void register_wave_api(ApiRegistry &registry, KernelContext &context);
-// MIDI as on a machine with no MIDI ports, for programs of either width.
+// MIDI and auxiliary devices as on a machine with none, for programs of either width.
 void register_midi_api(ApiRegistry &registry);
 void register_mmio_api(ApiRegistry &registry, KernelContext &context);
 void register_process_info_api(ApiRegistry &registry, KernelContext &context);
 void register_crypt32_api(ApiRegistry &registry, KernelContext &context);
 void register_bcrypt_api(ApiRegistry &registry, KernelContext &context);
 void register_font_service(ApiRegistry &registry, KernelContext &context);
+void register_sandbox_api(ApiRegistry &registry, KernelContext &context);
 // The HLSL compiler behind d3dcompiler_47.dll: requests from the guest component, results read back in parts.
 void register_shader_service(ApiRegistry &registry, KernelContext &context);
+// The sound engine for the guest's audio components: streams whose samples and counters live in a page the guest maps (raven_audio.h).
+void register_audio_service(ApiRegistry &registry, KernelContext &context);
 // An installed font family as GDI enumerates it: the face closest to regular, and the scripts and code pages its OS/2 table claims.
 struct InstalledFamily {
 	std::u16string name;
@@ -144,5 +156,8 @@ std::shared_ptr<class ProcessObject> start_program(KernelContext &context, const
 	std::vector<InheritedHandle> inherited = {});
 // Puts a child process into a job; false with the Windows error otherwise.
 bool assign_to_job(KernelContext &context, uint64_t job, const std::shared_ptr<class ProcessObject> &process, uint32_t &error);
+// Runs the user APCs queued to the current thread, oldest first, as an alertable wait does before it ends with WAIT_IO_COMPLETION; true
+// when any ran. A stop inside one propagates as the NativeResult.
+bool run_user_apcs(KernelContext &context);
 
 }

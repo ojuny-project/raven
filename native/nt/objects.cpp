@@ -139,6 +139,58 @@ int NativeObjects::signaled(uint64_t handle, uint32_t thread) const
 	return held->signaled(thread);
 }
 
+int NativeObjects::usable(uint64_t handle) const
+{
+	const auto held = object(handle);
+	if (!held) {
+		arrive(handle);
+		std::lock_guard lock(mutex);
+		return handles.contains(handle) ? -1 : -2;
+	}
+	if ((held->type_name() == u"Event" || held->type_name() == u"Mutant") && !(access_of(handle) & 0x100000))
+		return -3;
+	return 0;
+}
+
+int WaitedObjects::signaled(size_t index, uint32_t thread)
+{
+	if (held[index])
+		return held[index]->signaled(thread);
+	const int state = objects.signaled(handles[index], thread);
+	if (state >= 0)
+		held[index] = objects.object(handles[index]);
+	return state;
+}
+
+int WaitedObjects::usable(size_t index)
+{
+	if (held[index])
+		return 0;
+	const int state = objects.usable(handles[index]);
+	if (state >= 0)
+		held[index] = objects.object(handles[index]);
+	return state;
+}
+
+bool WaitedObjects::try_consume(size_t index, uint32_t thread)
+{
+	return held[index] ? held[index]->try_consume(thread) : objects.try_consume(handles[index], thread);
+}
+
+void WaitedObjects::consume(size_t index, uint32_t thread)
+{
+	if (held[index])
+		held[index]->consume(thread);
+	else
+		objects.consume(handles[index], thread);
+}
+
+std::optional<std::chrono::steady_clock::time_point> WaitedObjects::wakes_at(size_t index) const
+{
+	const auto object = held[index] ? held[index] : objects.object(handles[index]);
+	return object ? object->wakes_at() : std::nullopt;
+}
+
 void NativeObjects::consume(uint64_t handle, uint32_t thread)
 {
 	if (const auto held = object(handle)) held->consume(thread);
@@ -228,15 +280,20 @@ uint32_t NativeObjects::close(uint64_t handle)
 	static const bool traced = std::getenv("RAVEN_TRACE_HANDLES") != nullptr;
 	if (traced) std::fprintf(stderr, "handle %llx closed by %s\n", static_cast<unsigned long long>(handle), api_in_progress);
 	std::shared_ptr<KernelObject> generic;
+	bool last=false;
 	{
 		std::lock_guard lock(mutex);
 		const auto found=handles.find(handle);
 		if (found==handles.end()) return invalid_handle;
 		generic=std::move(found->second.generic);
 		handles.erase(found);
+		last=generic && generic->watches_last_handle() &&
+			std::none_of(handles.begin(),handles.end(),[&](const auto &entry) { return entry.second.generic==generic; });
 	}
 	if (const auto reserved=std::dynamic_pointer_cast<ReservedObject>(generic); reserved && reserved->on_close)
 		reserved->on_close(handle);
+	if (last)
+		generic->last_handle_closed();
 	return 0;
 }
 
@@ -268,6 +325,28 @@ NativeObjectResult NativeObjects::set_event(uint64_t handle, bool signaled)
 	return previous >= 0 ? NativeObjectResult{uint64_t(previous)} : NativeObjectResult{0,0xc0000024U};
 }
 
+std::shared_ptr<EventObject> NativeObjects::event_alone(uint64_t handle, uint32_t access) const
+{
+	if (handle >= handle_range_to_child)
+		return nullptr;
+	std::lock_guard lock(mutex);
+	const auto found = handles.find(handle);
+	if (found == handles.end() || (found->second.access & access) != access)
+		return nullptr;
+	return found->second.event;
+}
+
+std::shared_ptr<KernelObject> NativeObjects::object_alone(uint64_t handle, uint32_t access) const
+{
+	if (handle >= handle_range_to_child)
+		return nullptr;
+	std::lock_guard lock(mutex);
+	const auto found = handles.find(handle);
+	if (found == handles.end() || (found->second.access & access) != access)
+		return nullptr;
+	return found->second.generic;
+}
+
 std::optional<std::u16string> NativeObjects::type_name(uint64_t handle) const
 {
 	arrive(handle);
@@ -296,7 +375,7 @@ NativeObjectResult NativeObjects::wait(uint64_t handle, std::optional<int64_t> t
 	if (status) return {0,status};
 	if (timeout && *timeout>0) return {0,0xc00000bbU};
 	std::unique_lock lock(object->mutex);
-	if (!object->take()) {
+	if (!object->take(0)) {
 		if (timeout && !*timeout) return {0,0x102};
 		if (object->waiters.size()>=10000) return {0,0xc000009aU};
 		const auto now=std::chrono::steady_clock::now();
@@ -311,7 +390,7 @@ NativeObjectResult NativeObjects::wait(uint64_t handle, std::optional<int64_t> t
 		object->waiters.push_back(waiter);
 		const auto until = std::min(expires,deadline);
 		while (!waiter->ready) {
-			if (object->shared && object->take()) {
+			if (object->shared && object->take(0)) {
 				std::erase(object->waiters,waiter);
 				return {};
 			}

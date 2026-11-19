@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -38,6 +39,18 @@ public:
 	virtual uint32_t default_access() const { return 0x1f0003; }
 	// When the object turns signaled by itself, as a timer does at its due time; a waiter wakes then to look again.
 	virtual std::optional<std::chrono::steady_clock::time_point> wakes_at() const { return std::nullopt; }
+	// For an object other processes share: a word of the memory they share that changes, and is woken with a futex, whenever the object
+	// may have turned signaled. A wait on such objects alone sleeps on their words (see wait_words in shared_file.h).
+	virtual std::atomic<uint32_t> *wait_word() const { return nullptr; }
+	// For a semaphore whose count the process's table of waits keeps (kernel_waits.h): its object there, which may be released from any
+	// host thread. 0 for every other object.
+	virtual uint32_t table_semaphore() const { return 0; }
+	// The same for a mutex the table keeps.
+	virtual uint32_t table_mutex() const { return 0; }
+	// Objects that act when their last handle is closed say so here, and only they are looked for among the other handles then;
+	// last_handle_closed runs once that last handle is gone, as a completion port ends the waits on it.
+	virtual bool watches_last_handle() const { return false; }
+	virtual void last_handle_closed() {}
 };
 
 class NativeObjects;
@@ -73,6 +86,8 @@ public:
 	// A new handle for the named event; the status is 0xc0000034 when no such event is alive.
 	NativeObjectResult open_named_event(const std::u16string &name, uint32_t access);
 	NativeObjectResult inherit_file(int descriptor);
+	// A handle inherit_file made, given another descriptor in place of its own: the same handle now names what that one does.
+	uint32_t refresh_file(uint64_t handle, int descriptor);
 	// Reads from an inherited standard handle; the value is the byte count, zero at the end of the input.
 	NativeObjectResult read_file(uint64_t handle,std::span<uint8_t> into);
 	NativeObjectResult file_type(uint64_t handle) const;
@@ -90,6 +105,8 @@ public:
 	template<typename T> std::shared_ptr<T> object_as(uint64_t handle) const { return std::dynamic_pointer_cast<T>(object(handle)); }
 	// Waiting state of any handle kind (see KernelObject::signaled); -2 when the handle does not exist.
 	int signaled(uint64_t handle, uint32_t thread) const;
+	// What signaled gives for a handle that cannot be waited for, and 0 for one that can, without looking at its object's state.
+	int usable(uint64_t handle) const;
 	void consume(uint64_t handle, uint32_t thread);
 	// Takes what a satisfied wait takes; false when another process took it first.
 	bool try_consume(uint64_t handle, uint32_t thread);
@@ -108,6 +125,11 @@ public:
 	// Process requests share the handle channel, but the process owner validates and serves them.
 	std::function<InheritedHandle(const InheritedHandle &)> process_request;
 	NativeObjectResult set_event(uint64_t handle, bool signaled);
+	// For a call answered beside the others, outside the runtime's turn: the event of this process the handle gives the access to (to
+	// set it, unless asked otherwise); nothing when the call needs the runtime (any other handle, or an error to report).
+	std::shared_ptr<EventObject> event_alone(uint64_t handle, uint32_t access = 2) const;
+	// The object behind a handle of this process that grants `access`, for a host thread that does not hold the turn; null otherwise.
+	std::shared_ptr<KernelObject> object_alone(uint64_t handle, uint32_t access) const;
 	NativeObjectResult query_event(uint64_t handle);
 	// The object manager type of the object behind a handle; nullopt when the handle does not exist.
 	std::optional<std::u16string> type_name(uint64_t handle) const;
@@ -126,7 +148,12 @@ private:
 	};
 	struct Handle { std::shared_ptr<EventObject> event; uint32_t access; std::shared_ptr<File> file; std::shared_ptr<KernelObject> generic = {}; bool inherit = false; };
 	mutable std::mutex mutex;
-	std::map<uint64_t,Handle> handles;
+	// Handles are multiples of four, and Windows leaves the two low bits to the program, which may tag a handle with them (as SNI does
+	// an event's): lookups ignore those bits.
+	struct UntaggedOrder {
+		bool operator()(uint64_t left, uint64_t right) const { return (left & ~uint64_t(3)) < (right & ~uint64_t(3)); }
+	};
+	std::map<uint64_t,Handle,UntaggedOrder> handles;
 	std::map<std::u16string,std::weak_ptr<EventObject>> named_events;
 	uint64_t next = 0x100;
 	// The next free handle value; the caller holds the mutex. Values that inherited handles occupy are skipped.
@@ -137,4 +164,26 @@ private:
 	std::shared_ptr<File> file(uint64_t handle) const;
 };
 
+
+// What a wait holds: the objects its handles named when it began. A wait on Windows references its objects, so a handle closed while
+// a thread waits on it neither fails the wait nor leaves it with nothing to wake it: the wait ends when the object is signaled. A
+// worker that closes its own handle on its way out, as one started with _beginthread does, ends the wait of its creator this way.
+class WaitedObjects {
+public:
+	WaitedObjects(NativeObjects &objects, std::span<const uint64_t> handles) : objects(objects), handles(handles.begin(), handles.end()),
+		held(handles.size()) {}
+	// The state NativeObjects::signaled gives for the handle until the wait has its object, the object's own from then on.
+	int signaled(size_t index, uint32_t thread);
+	// As NativeObjects::usable, for the handle at `index`.
+	int usable(size_t index);
+	bool try_consume(size_t index, uint32_t thread);
+	void consume(size_t index, uint32_t thread);
+	// When the object turns signaled by itself, as a timer does.
+	std::optional<std::chrono::steady_clock::time_point> wakes_at(size_t index) const;
+
+private:
+	NativeObjects &objects;
+	std::vector<uint64_t> handles;
+	std::vector<std::shared_ptr<KernelObject>> held;
+};
 }

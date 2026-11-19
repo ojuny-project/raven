@@ -12,26 +12,29 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import time
-import urllib.request
 
 from component_licenses import mark_patched_sources
+import downloads
 
 
 # Libraries taken from their own releases: zlib, which cabinet.dll, msxml3.dll, the image libraries and raven-appx.dll compress and
-# inflate with, and the Independent JPEG Group's library the codecs read and write JPEG through. Each is kept beside the components
-# as NAME-VERSION-source.tar.gz with the notices listed here, and unpacked to NAME-source.
+# inflate with, the Independent JPEG Group's library the codecs read and write JPEG through, and Wuffs, whose decoders the codecs read
+# PNG with. Each is kept beside the components as NAME-VERSION-source.tar.gz with the notices listed here, and unpacked to NAME-source.
 UPSTREAM = {
     "zlib": dict(version="1.3.1", sha256="9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
-                 url="https://zlib.net/fossils/zlib-{version}.tar.gz", notices=("LICENSE", "README")),
+                 urls=("https://zlib.net/fossils/zlib-{version}.tar.gz",
+                       "https://github.com/madler/zlib/releases/download/v{version}/zlib-{version}.tar.gz"),
+                 notices=("LICENSE", "README")),
     "libjpeg": dict(version="10", sha256="8b9eaa13242690ebd03e1728ab1edf97a81a78ed6e83624d493655f31ac95ab5",
-                    url="https://www.ijg.org/files/jpegsrc.v{version}.tar.gz", notices=("README",)),
+                    urls=("https://www.ijg.org/files/jpegsrc.v{version}.tar.gz",), notices=("README",)),
     "libtiff": dict(version="4.7.1", sha256="f698d94f3103da8ca7438d84e0344e453fe0ba3b7486e04c5bf7a9a3fabe9b69",
-                    url="https://download.osgeo.org/libtiff/tiff-{version}.tar.gz", notices=("LICENSE.md", "README.md")),
+                    urls=("https://download.osgeo.org/libtiff/tiff-{version}.tar.gz",), notices=("LICENSE.md", "README.md")),
     "libxml2": dict(version="2.12.8", sha256="43ad877b018bc63deb2468d71f95219c2fac196876ef36d1bee51d226173ec93",
-                    url="https://download.gnome.org/sources/libxml2/2.12/libxml2-{version}.tar.xz", notices=("Copyright", "README.md")),
+                    urls=("https://download.gnome.org/sources/libxml2/2.12/libxml2-{version}.tar.xz",), notices=("Copyright", "README.md")),
     "libxslt": dict(version="1.1.42", sha256="85ca62cac0d41fc77d3f6033da9df6fd73d20ea2fc18b0a3609ffb4110e1baeb",
-                    url="https://download.gnome.org/sources/libxslt/1.1/libxslt-{version}.tar.xz", notices=("Copyright", "README.md")),
+                    urls=("https://download.gnome.org/sources/libxslt/1.1/libxslt-{version}.tar.xz",), notices=("Copyright", "README.md")),
+    "wuffs": dict(version="0.4.0-alpha.12", sha256="0c1c84aa93fcaeda523ed517848b1555e72e679c37780aaa2db8d7e5b8ff78f1",
+                  urls=("https://github.com/google/wuffs/archive/refs/tags/v{version}.tar.gz",), notices=("LICENSE", "LICENSE-APACHE", "LICENSE-MIT")),
 }
 # The parts of libxml2 msxml3.dll is built with, and the features its configuration turns on for them.
 XML_SOURCES = ("buf.c", "catalog.c", "chvalid.c", "debugXML.c", "dict.c", "encoding.c", "entities.c", "error.c", "globals.c", "hash.c",
@@ -92,35 +95,6 @@ def configure_file(template, target, values):
     target.write_text(text)
 
 
-def download(url, path):
-    # Download servers answer with a gateway error or stall now and then; a few spaced attempts ride it out. A missing file does not come
-    # back.
-    for attempt in range(4):
-        try:
-            urllib.request.urlretrieve(url, path)
-            return
-        except OSError as error:
-            if attempt == 3 or (isinstance(error, urllib.error.HTTPError) and error.code < 500):
-                raise
-            time.sleep(15 * (attempt + 1))
-
-
-# Downloads an archive beside where it belongs and moves it into place once its checksum matches, so an interrupted download is not kept;
-# one already there is checked the same way.
-def fetch(url, archive, sha256, what):
-    if not archive.exists():
-        temporary = archive.with_suffix(archive.suffix + ".part")
-        try:
-            download(url, temporary)
-            if hashlib.sha256(temporary.read_bytes()).hexdigest() != sha256:
-                raise RuntimeError(f"downloaded {what} checksum differs")
-            temporary.replace(archive)
-        finally:
-            temporary.unlink(missing_ok=True)
-    if hashlib.sha256(archive.read_bytes()).hexdigest() != sha256:
-        raise RuntimeError(f"{what} checksum differs: {archive} is incomplete or another version; delete it to download it again")
-
-
 def main():
     parser = argparse.ArgumentParser(description="Build the Windows Installer components and the libraries they install with")
     parser.add_argument("--output", type=Path, required=True)
@@ -143,8 +117,8 @@ def main():
     upstream_sources = {}
     for name, release in UPSTREAM.items():
         version = release["version"]
-        packed = output / f"{name}-{version}-source.tar.{release['url'].rsplit('.', 1)[1]}"
-        fetch(release["url"].format(version=version), packed, release["sha256"], f"{name} {version} source archive")
+        packed = output / f"{name}-{version}-source.tar.{release['urls'][0].rsplit('.', 1)[1]}"
+        downloads.fetch([url.format(version=version) for url in release["urls"]], packed, release["sha256"], f"{name} {version} source archive")
         unpacked = upstream_sources[name] = output / f"{name}-source"
         shutil.rmtree(unpacked, ignore_errors=True)
         with tarfile.open(packed) as upstream:
@@ -188,6 +162,22 @@ def main():
             if (directory / header).exists():
                 return directory
         raise RuntimeError(f"the {triple} compiler has no {header}")
+
+    def idl_include():
+        """The directory that holds the platform's interface definitions widl imports (oaidl.idl and the files it imports): beside the
+        cross compiler's headers on Fedora, and only in Wine's development headers on Debian, Devuan and Ubuntu, whose MinGW-w64 packages
+        carry the .h files alone."""
+        candidates = [mingw_include("objidl.h")]
+        widl_path = shutil.which("widl")
+        if widl_path:
+            prefix = Path(widl_path).resolve().parent.parent
+            candidates += [prefix / "include/wine/wine/windows", prefix / "include/wine/windows"]
+        candidates += [Path("/usr/include/wine/wine/windows"), Path("/usr/include/wine/windows"), Path("/usr/share/mingw-w64/include")]
+        for directory in candidates:
+            if (directory / "oaidl.idl").exists():
+                return directory
+        raise RuntimeError("widl needs oaidl.idl, which neither the MinGW-w64 headers nor Wine's development headers provide here: install "
+                           "mingw64-headers on Fedora, or libwine-dev on Debian, Devuan and Ubuntu")
 
     def decorated(object_files):
         """Defined global functions of the objects by plain name, with their stdcall argument bytes on 32 bits (None for the others)."""
@@ -234,7 +224,7 @@ def main():
     shutil.rmtree(objects, ignore_errors=True)
     objects.mkdir()
 
-    def compile(path, name, extra=()):
+    def compile_object(path, name, extra=()):
         target = objects / (name + ".o")
         run([triple + "-gcc", "-c", *flags, *extra, "-I" + str(generated), path, "-o", target])
         return target
@@ -263,10 +253,10 @@ def main():
     run([triple + "-dlltool", "-d", expansion, "-l", output / "liblzimports.a", *(["-k"] if x86 else [])])
     # cabinet.dll: cabinet files, their compression and extraction, on zlib.
     zlib_include = zlib_source
-    zlib = [compile(zlib_source / name, "zlib_" + Path(name).stem, ["-I" + str(zlib_include)]) for name in ZLIB]
+    zlib = [compile_object(zlib_source / name, "zlib_" + Path(name).stem, ["-I" + str(zlib_include)]) for name in ZLIB]
     cabinet_root = repo / "native/guest/raven-cabinet"
     with ThreadPoolExecutor(max_workers=2) as pool:
-        cabinet = list(pool.map(lambda name: compile(cabinet_root / name, "cabinet_" + Path(name).stem,
+        cabinet = list(pool.map(lambda name: compile_object(cabinet_root / name, "cabinet_" + Path(name).stem,
                                                      ["-I" + str(cabinet_root), "-I" + str(zlib_include)]),
                                 ("compose.c", "extract.c", "lzx.c", "quantum.c", "session.c")))
     (output / "cabinet.def").write_text(spec_exports(cabinet_root / "cabinet.spec", "cabinet.dll", x86))
@@ -282,7 +272,7 @@ def main():
     (output / "sxs_import.def").write_text("LIBRARY sxs.dll\nEXPORTS\n" + "".join(f" {name}{'@' + str(size) if x86 else ''}\n" for name, size in
                                            (("CreateAssemblyCache", 8), ("CreateAssemblyNameObject", 16), ("SxsLookupClrGuid", 24), ("SxspGenerateManifestPathOnAssemblyIdentity", 16))))
     run([triple + "-dlltool", *(["-k"] if x86 else []), "-d", output / "sxs_import.def", "-l", output / "libsxs.a"])
-    compile(support / "support.c", "installer_support")
+    compile_object(support / "support.c", "installer_support")
     # rpcrt4.dll: Raven's own remote procedure calls, which the installer's custom action server speaks over local pipes.
     own_rpc = repo / "native/guest/raven-rpcrt4"
     rpc_objects = []
@@ -350,7 +340,7 @@ def main():
     run([triple + "-dlltool", "-d", output / "crtmath.def", "-l", output / "libcrtmath.a"])
     xml_sources = [xml_root / name for name in XML_SOURCES]
     with ThreadPoolExecutor(max_workers=2) as pool:
-        xml = list(pool.map(lambda path: compile(path, "libxml2_" + path.stem, xml_flags), xml_sources))
+        xml = list(pool.map(lambda path: compile_object(path, "libxml2_" + path.stem, xml_flags), xml_sources))
     # libxslt's configuration: its own one for Windows, which its internal header reads as config.h under mingw, and a version header
     # with the debugger, profiler, plugins and trio left out.
     shutil.copyfile(xslt_root / "libxslt/win32config.h", xslt_root / "libxslt/config.h")
@@ -360,13 +350,13 @@ def main():
         WITH_XSLT_DEBUG=0, WITH_TRIO=0, WITH_DEBUGGER=0, WITH_PROFILER=0, WITH_MODULES=0, LIBXSLT_DEFAULT_PLUGINS_PATH=""))
     xslt_flags = [*xml_flags, "-DHAVE_WIN32_THREADS", "-I" + str(xslt_root), "-I" + str(xslt_root / "libxslt")]
     with ThreadPoolExecutor(max_workers=2) as pool:
-        xslt = list(pool.map(lambda path: compile(path, "libxslt_" + path.stem, xslt_flags), sorted((xslt_root / "libxslt").glob("*.c"))))
+        xslt = list(pool.map(lambda path: compile_object(path, "libxslt_" + path.stem, xslt_flags), sorted((xslt_root / "libxslt").glob("*.c"))))
     # Its registration scripts' type library comes from the public headers, and stays with stdole2's for what else needs it.
     run([*widl, "-t", "-T", generated / "stdole2.tlb", repo / "native/guest/raven-oleaut32/stdole2.idl"])
     own_msxml = repo / "native/guest/raven-msxml3"
     headers = mingw_include("msxml2.h")
     run([sys.executable, own_msxml / "make_idl.py", headers / "msxml2.h", headers / "msxml2did.h", headers / "msxml.h", generated / "msxml3.idl"])
-    run([*widl, "-I", headers, "-L", generated, "-t", "-o", generated / "msxml3.tlb", generated / "msxml3.idl"])
+    run([*widl, "-I", headers, "-I", idl_include(), "-L", generated, "-t", "-o", generated / "msxml3.tlb", generated / "msxml3.idl"])
     run([triple + "-windres", "-O", "coff", "-I", generated, "-i", own_msxml / "resources.rc", "-o", objects / "msxml3_resources.o"])
     msxml_flags = ["-O2", "-std=gnu11", "-D_WIN32_WINNT=0x601", "-DUNICODE", "-DLIBXML_STATIC", "-DLIBXSLT_STATIC", "-DCONST_VTABLE", "-I" + str(own_msxml),
                    "-I" + str(xml_root / "include"), "-I" + str(xml_root), "-I" + str(xslt_root)]
@@ -418,14 +408,14 @@ def main():
         (output / (stem + ".def")).write_text(spec_exports(spec, name, x86))
         flags_here = [*extra_flags, "-I" + str(root)]
         with ThreadPoolExecutor(max_workers=2) as pool:
-            built = list(pool.map(lambda path: compile(path, stem + "_" + path.stem.replace(".", "_"), flags_here), sources))
+            built = list(pool.map(lambda path: compile_object(path, stem + "_" + path.stem.replace(".", "_"), flags_here), sources))
         next_base[0] -= 0x400000 if x86 else 0x4000000
         link(name, next_base[0], [*built, *objects_more, objects / "installer_support.o"], output / (stem + ".def"),
              ["-L" + str(output), "-lcrtmath", *[f"-l{library}" for library in (*libraries, "msvcrt", "mingwex", "kernel32", "ntdll", "uuid", "gcc", "kernel32", "msvcrt", "kernel32")]],
              output / ("lib" + stem + ".a"))
 
     plain = ["-D_CRT_DECLARE_NONSTDC_NAMES=1", "-D_DLL", "-DWIN32", "-D_WINDOWS"]
-    entry_object = compile(support / "dllmain.c", "plain_dllmain")
+    entry_object = compile_object(support / "dllmain.c", "plain_dllmain")
     # libjpeg.dll: the library's sources as its makefile lists them, with the memory manager that needs no temporary files, exporting the
     # whole interface jpeglib.h declares.
     jpeg_sources = re.search(r"^LIBSOURCES *=(.*?)\n\n", (jpeg_source / "Makefile.am").read_text(), re.S | re.M).group(1)
@@ -487,13 +477,16 @@ def main():
     (output / "mlang_import.def").write_text("LIBRARY mlang.dll\nEXPORTS\n" + "".join(f" {name}\n" for name in mlang_names))
     run([triple + "-dlltool", *(["-k"] if x86 else []), "-d", output / "mlang_import.def", "-l", output / "libmlang.a"])
     # windowscodecs.dll: Raven's own imaging component; JPEG and TIFF go through the libraries built above, named by path so
-    # no export of the component can resolve to one of the installer's own import libraries.
+    # no export of the component can resolve to one of the installer's own import libraries, and PNG through the Wuffs release's single
+    # C file, which wuffs.c builds in.
     own_codecs = repo / "native/guest/raven-windowscodecs"
     codecs_objects = []
     for path in [*sorted(own_codecs.glob("*.c")), repo / "native/guest/raven-comctl32/crt.c"]:
         target = objects / ("codecs_" + path.stem + ".o")
-        run([triple + "-gcc", "-c", "-O2", "-std=gnu11", "-fno-builtin", "-D_WIN32_WINNT=0x601", "-DUNICODE", "-D_CRTIMP=", "-DCOBJMACROS", "-I" + str(own_codecs),
-             "-I" + str(jpeg_source), "-I" + str(tiff_source), "-w", path, "-o", target])
+        # Wuffs reads unaligned words through small copies of a fixed size, which only the compiler's own memcpy turns into loads.
+        builtins = [] if path.name == "wuffs.c" else ["-fno-builtin"]
+        run([triple + "-gcc", "-c", "-O2", "-std=gnu11", *builtins, "-D_WIN32_WINNT=0x601", "-DUNICODE", "-D_CRTIMP=", "-DCOBJMACROS", "-I" + str(own_codecs),
+             "-I" + str(jpeg_source), "-I" + str(tiff_source), "-I" + str(upstream_sources["wuffs"] / "release" / "c"), "-w", path, "-o", target])
         codecs_objects.append(target)
     codecs_exports = (own_codecs / "exports.txt").read_text()
     (output / "windowscodecs.def").write_text("LIBRARY windowscodecs.dll\nEXPORTS\n" + codecs_exports)
@@ -545,7 +538,7 @@ def main():
          "-o", output / "urlmon.dll", *urlmon_objects, output / "urlmon.def", "-luuid", "-lole32", "-loleaut32", "-lshlwapi", "-ladvapi32", "-lwininet", "-luser32", "-lshell32", "-lkernel32", "-lgcc"])
     # riched20.dll: Raven's own rich edit control, with the type library of its text object model that its resources carry.
     own_riched = repo / "native/guest/raven-riched20"
-    run([*widl, "-L", generated, "-t", "-T", generated / "tom_library.tlb", own_riched / "tom_library.idl"])
+    run([*widl, "-I", idl_include(), "-L", generated, "-t", "-T", generated / "tom_library.tlb", own_riched / "tom_library.idl"])
     run([triple + "-windres", "-I", generated, own_riched / "resources.rc", "-o", objects / "riched20.res.o"])
     riched_objects = [objects / "riched20.res.o"]
     for path in [*sorted(own_riched.glob("*.c")), repo / "native/guest/raven-comctl32/crt.c"]:
@@ -565,7 +558,7 @@ def main():
         "IID_IRichEditOleCallback", "IID_ITextHost", "IID_ITextHost2", "IID_ITextServices", "REExtendedRegisterClass", "RichEdit10ANSIWndProc",
         "RichEditANSIWndProc")))
     next_base[0] -= 0x400000 if x86 else 0x4000000
-    link("msftedit.dll", next_base[0], [compile(support / "msftedit.c", "msftedit", plain)], output / "msftedit.def",
+    link("msftedit.dll", next_base[0], [compile_object(support / "msftedit.c", "msftedit", plain)], output / "msftedit.def",
          ["-L" + str(output), *[f"-l{library}" for library in ("riched20", "kernel32", "gcc")]])
     # msvfw32.dll: Raven's own video for Windows: the codec manager, DrawDib and the MCI window.
     own_vfw = repo / "native/guest/raven-msvfw32"

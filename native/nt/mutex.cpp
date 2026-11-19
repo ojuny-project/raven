@@ -1,8 +1,11 @@
 #include "mutex.h"
+#include <bit>
+#include "kernel_waits.h"
 
 #include <new>
 #include <stdexcept>
 #include <sys/stat.h>
+#include <utility>
 
 namespace raven {
 
@@ -16,6 +19,17 @@ std::optional<uint32_t> mutex_access(uint32_t requested)
 	if (requested & 0x20000000U) access |= 0x120000;
 	if (requested & (0x10000000U | 0x02000000U)) access |= 0x1f0001;
 	return access;
+}
+
+MutexObject::MutexObject() : waits_object(raven_waits_create(kernel_waits(), raven_mutex, 0, 0))
+{
+}
+
+void MutexObject::leave_table()
+{
+	std::lock_guard lock(mutex);
+	if (waits_object)
+		raven_waits_detach(kernel_waits(), std::exchange(waits_object, 0), nullptr, nullptr, nullptr);
 }
 
 MutexObject::MutexObject(int descriptor) : descriptor(descriptor)
@@ -39,6 +53,8 @@ MutexObject::MutexObject(int descriptor) : descriptor(descriptor)
 
 MutexObject::~MutexObject()
 {
+	if (waits_object)
+		raven_waits_close(kernel_waits(), waits_object);
 	if (descriptor >= 0) {
 		::munmap(state, sizeof(MutexState));
 		::close(descriptor);
@@ -54,6 +70,9 @@ uint64_t MutexObject::me(uint32_t thread) const
 int MutexObject::signaled(uint32_t thread) const
 {
 	std::lock_guard lock(mutex);
+	uint32_t owner = 0;
+	if (waits_object)
+		return raven_waits_query(kernel_waits(), waits_object, &owner) == 0 && (owner == 0 || owner == thread);
 	const auto holder = state->owner.load();
 	return holder == 0 || holder == me(thread);
 }
@@ -61,6 +80,10 @@ int MutexObject::signaled(uint32_t thread) const
 bool MutexObject::try_consume(uint32_t thread)
 {
 	std::lock_guard lock(mutex);
+	if (waits_object) {
+		const uint32_t result = raven_waits_wait(kernel_waits(), thread, &waits_object, 1, 0, 0, 0);
+		return result == 0 || result == 0x80;
+	}
 	const auto self = me(thread);
 	if (state->owner.load() == self) {
 		++state->recursion;
@@ -73,15 +96,28 @@ bool MutexObject::try_consume(uint32_t thread)
 	return true;
 }
 
+std::atomic<uint32_t> *MutexObject::wait_word() const
+{
+	std::lock_guard lock(mutex);
+	if (!shared && descriptor < 0)
+		return nullptr;
+	static_assert(sizeof(std::atomic<uint64_t>) == 8 && std::endian::native == std::endian::little);
+	return reinterpret_cast<std::atomic<uint32_t> *>(&state->owner);
+}
+
 bool MutexObject::release(uint32_t thread)
 {
 	std::lock_guard lock(mutex);
+	if (waits_object)
+		return raven_waits_release_mutex(kernel_waits(), waits_object, thread, nullptr) == 0;
 	if (state->owner.load() != me(thread) || state->recursion.load() <= 0)
 		return false;
 	if (--state->recursion == 0) {
 		state->owner = 0;
-		if (shared || descriptor >= 0)
+		if (shared || descriptor >= 0) {
+			wake_word(reinterpret_cast<std::atomic<uint32_t> *>(&state->owner));
 			announce_shared_change();
+		}
 	}
 	return true;
 }
@@ -104,6 +140,13 @@ bool MutexObject::describe(InheritedHandle &record) const
 			return false;
 		}
 		auto *storage = new (mapped) MutexState();
+		// The mutex leaves the table with its owner; the waits there for it end, to wait again on the shared one.
+		if (waits_object) {
+			uint32_t owner = 0, depth = 0;
+			raven_waits_detach(kernel_waits(), std::exchange(waits_object, 0), nullptr, &owner, &depth);
+			state->owner = owner ? me(owner) : 0;
+			state->recursion = int32_t(depth);
+		}
 		storage->owner = state->owner.load();
 		storage->recursion = state->recursion.load();
 		state = storage;

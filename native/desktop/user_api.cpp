@@ -8,6 +8,12 @@
 
 namespace raven {
 
+static uint64_t &message_extra_info()
+{
+	thread_local uint64_t value = 0;
+	return value;
+}
+
 namespace {
 
 struct Rect {
@@ -151,7 +157,13 @@ void NativeWindows::register_api(ApiRegistry &registry)
 	registry.add("GetDoubleClickTime", 0, [](ApiCall &call) { call.ret(500); });
 	registry.add("GetCaretBlinkTime", 0, [](ApiCall &call) { call.ret(530); });
 	registry.add("GetKeyboardLayout", 1, [](ApiCall &call) { call.ret(0x04090409); });
-	registry.add("GetMessageExtraInfo", 0, [](ApiCall &call) { call.ret(0); });
+	// The extra information of a thread's last message: what the thread itself set, since no input source attaches any.
+	registry.add("GetMessageExtraInfo", 0, [](ApiCall &call) { call.ret(message_extra_info()); });
+	registry.add("SetMessageExtraInfo", 1, [](ApiCall &call) {
+		const uint64_t previous = message_extra_info();
+		message_extra_info() = call[0];
+		call.ret(previous);
+	});
 	// The one keyboard layout, US English, by its KLID.
 	registry.add("GetKeyboardLayoutNameW", 1, [](ApiCall &call) {
 		call.put_wide(call[0], u"00000409", 9);
@@ -181,9 +193,6 @@ void NativeWindows::register_api(ApiRegistry &registry)
 		}
 		call.store<uint32_t>(call[0] + 4, uint32_t(now));
 		call.ret(1);
-	});
-	registry.add("GetMessageTime", 0, [](ApiCall &call) {
-		call.ret(uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
 	});
 	// The handles a process holds in the window system: windows, device contexts and drawing objects are one table here.
 	registry.add("GetGuiResources", 2, [this](ApiCall &call) {
