@@ -33,9 +33,20 @@
             inherit (pkgs) lib;
             inherit pkgs;
           };
+          ravenContract = pkgs.runCommand "check-raven-package-contract" { } ''
+            while IFS= read -r name; do
+              test -e ${tests.package}/libexec/raven/"$name"
+            done < ${tests.package}/libexec/raven/runtime-contract.txt
+            touch $out
+          '';
         in
         {
-          default = tests.default;
+          default = pkgs.runCommand "check-default" { } ''
+            echo ${tests.default} >/dev/null
+            echo ${ravenContract} >/dev/null
+            touch $out
+          '';
+          raven-package-contract = ravenContract;
           inherit (tests) package;
         }
       );

@@ -77,9 +77,27 @@ let
   };
 
   vkd3dArchive = fetchurl {
-    name = "vkd3d-proton-3.0.1.tar.zst";
-    url = "https://github.com/HansKristian-Work/vkd3d-proton/releases/download/v3.0.1/vkd3d-proton-3.0.1.tar.zst";
-    hash = "sha256-PPIxVSKvXkNgXvbTxB2tkThwQL+XGZk08/erdsqqLww=";
+    name = "vkd3d-proton-3.1.tar.zst";
+    url = "https://github.com/HansKristian-Work/vkd3d-proton/releases/download/v3.1/vkd3d-proton-3.1.tar.zst";
+    hash = "sha256-uF6oIZtxCTo5JJE916rmFyMz3AwGmYPtUQgW1n8CEgs=";
+  };
+
+  dxvkArchive = fetchurl {
+    name = "dxvk-3.1.1.tar.gz";
+    url = "https://github.com/doitsujin/dxvk/releases/download/v3.1.1/dxvk-3.1.1.tar.gz";
+    hash = "sha256-QFZbSnJKrcRDP6TgELSyORbZsfG67uZOFxhtuU9U5gg=";
+  };
+
+  wuffsSource = fetchurl {
+    name = "wuffs-0.4.0-alpha.12-source.tar.gz";
+    url = "https://github.com/google/wuffs/archive/refs/tags/v0.4.0-alpha.12.tar.gz";
+    hash = "sha256-DByEqpP8rtpSPtUXhIsVVecuZ5w3eAqqLbjX5bj/ePE=";
+  };
+
+  libpngSource = fetchurl {
+    name = "libpng-1.6.59.tar.xz";
+    url = "https://download.sourceforge.net/libpng/libpng-1.6.59.tar.xz";
+    hash = "sha256-2A3So4o3+APLm2rHsUvW503cO2VHgKg4C9+TUj/bQ4k=";
   };
 
   npp = fetchurl {
@@ -224,6 +242,7 @@ let
         cp ${libtiffSource} $out/libtiff-4.7.1-source.tar.gz
         cp ${libxml2Source} $out/libxml2-2.12.8-source.tar.xz
         cp ${libxsltSource} $out/libxslt-1.1.42-source.tar.xz
+        cp ${wuffsSource} $out/wuffs-0.4.0-alpha.12-source.tar.gz
         cp -a ${src}/scripts $TMPDIR/raven-scripts
         chmod -R u+w $TMPDIR/raven-scripts
 
@@ -400,6 +419,16 @@ CLSID_EOF
     test -f $out/fonts/LiberationSans-Regular.ttf
     test -f $out/fonts/RavenSans-Regular.ttf
   '';
+
+  dxvkTree = pkgs.runCommand "raven-dxvk-3.1.1" {
+    nativeBuildInputs = [
+      pkgs.gnutar
+      pkgs.gzip
+    ];
+  } ''
+    mkdir -p $out
+    tar -xzf ${dxvkArchive} -C $out --strip-components=1
+  '';
 in
 {
   inherit
@@ -415,10 +444,11 @@ in
   installer64 = installer "x64";
   installer32 = installer "x86";
 
-  dxvk64 = pkgs.dxvk.passthru.dxvk64;
-  dxvk32 = pkgs.dxvk.passthru.dxvk32;
+  dxvk = dxvkTree;
+  dxvk64 = "${dxvkTree}/x64";
+  dxvk32 = "${dxvkTree}/x32";
 
-  vkd3d = pkgs.runCommand "raven-vkd3d-proton-3.0.1" {
+  vkd3d = pkgs.runCommand "raven-vkd3d-proton-3.1" {
     nativeBuildInputs = [
       pkgs.gnutar
       pkgs.zstd
@@ -430,7 +460,25 @@ in
     mv $out/x86 $out/pe32
   '';
 
-  libpng = pkgs.libpng;
+  libpng = pkgs.stdenv.mkDerivation {
+    pname = "raven-libpng";
+    version = "1.6.59";
+    src = libpngSource;
+
+    nativeBuildInputs = [
+      pkgs.cmake
+      pkgs.ninja
+    ];
+
+    buildInputs = [ pkgs.zlib ];
+
+    cmakeFlags = [
+      "-DPNG_SHARED=OFF"
+      "-DPNG_TESTS=OFF"
+      "-DPNG_TOOLS=OFF"
+      "-DCMAKE_INSTALL_LIBDIR=lib"
+    ];
+  };
   fonts = "${fontOutput}/fonts";
 
   inherit fontOutput skia skiaDeps;

@@ -18,10 +18,14 @@ let
     pkgsCross = pkgs.pkgsCross;
   };
 
-  version = "0-unstable-2026-11-09";
+  version = "0-unstable-2026-11-19";
 
   mingw64 = pkgs.pkgsCross.mingwW64.stdenv.cc;
   mingw32 = pkgs.pkgsCross.mingw32.stdenv.cc;
+
+  cargoDeps = pkgs.rustPlatform.importCargoLock {
+    lockFile = ../native/waits/Cargo.lock;
+  };
 
   runtimeComponents = [
     "comctl32.dll"
@@ -31,6 +35,15 @@ let
     "raven-d2d1.dll"
     "raven-uianimation.dll"
     "ucrtbase.dll"
+    "dcomp.dll"
+    "coremessaging.dll"
+    "raven-web.dll"
+    "raven-wmi.dll"
+    "raven-ieframe.dll"
+    "raven-winmm.dll"
+    "raven-msacm32.dll"
+    "dsound.dll"
+    "ucrtbase32.dll"
     "raven-rtl.dll"
     "raven-storage.dll"
     "raven-appx.dll"
@@ -83,6 +96,8 @@ let
     "cscript.exe"
     "wscript.exe"
     "control.exe"
+    "raven-picker.exe"
+    "raven-host.exe"
     "dism.exe"
     "fondue.exe"
     "msiexec.exe"
@@ -105,7 +120,7 @@ let
     "rundll32.exe"
   ];
 
-  testFilter = "^(pe_contracts|module_set_contracts|native_(cpu_contracts|memory_contracts|parallel_memory_contracts|parallel_stop_contract|x86_contracts|shared_mapping_contract|provider_contract|launch_arguments_contract|ansi_code_page|hlsl_compiler|update_regions|keyboard_layouts|font_ownership|compatible_bitmap_contract|bitblt_contract|class_info_ownership|window_data_ownership|brush_ownership|exception_contract|object_contract|handle_channel_contract|firmware_memory|string_resource_contract|resource_contract|process_parameters|menu_ownership|extract_icons_contract|png_codec_contract|icon_dib_contract|icon_group_contract|blackonwhite_contract))$";
+  testFilter = "^(pe_contracts|module_set_contracts|native_(cpu_contracts|memory_contracts|parallel_memory_contracts|parallel_stop_contract|x86_contracts|shared_mapping_contract|provider_contract|launch_arguments_contract|ansi_code_page|hlsl_compiler|update_regions|keyboard_layouts|font_ownership|compatible_bitmap_contract|bitblt_contract|class_info_ownership|window_data_ownership|brush_ownership|exception_contract|object_contract|handle_channel_contract|firmware_memory|string_resource_contract|resource_contract|process_parameters|menu_ownership|extract_icons_contract|png_codec_contract|icon_dib_contract|icon_group_contract|blackonwhite_contract|cpu_contracts_threaded|memory_contracts_threaded|cpu_contracts_agent|memory_contracts_agent|cpu_contracts_agent_threaded|memory_contracts_agent_threaded|cpu_contracts_held|memory_contracts_held|cpu_contracts_held_threaded|memory_contracts_held_threaded|x86_contracts_threaded|x86_contracts_held|x86_contracts_held_threaded|x86_contracts_agent|provider_contract_threaded|provider_contract_held|agent_contract|agent_process))$";
 
   raven-unwrapped = pkgs.stdenv.mkDerivation {
     pname = "raven-unwrapped";
@@ -123,6 +138,8 @@ let
       pkgs.clang
       pkgs.lld
       pkgs.openssl
+      pkgs.cargo
+      pkgs.rustc
       mingw64
       mingw32
     ];
@@ -143,11 +160,21 @@ let
       pkgs.vulkan-headers
       pkgs.freetype
       pkgs.openssl
-      pkgs.libpng
+      pkgs.zlib
       pkgs.libpulseaudio
     ];
 
     preConfigure = ''
+      export CARGO_HOME=$TMPDIR/cargo
+      export CARGO_NET_OFFLINE=true
+      mkdir -p "$CARGO_HOME"
+      cat > "$CARGO_HOME/config.toml" <<EOF
+      [source.crates-io]
+      replace-with = "vendored-sources"
+
+      [source.vendored-sources]
+      directory = "${cargoDeps}"
+      EOF
       mkdir -p build/testdata/downloads
       cp -a ${components.fixtures}/downloads/. build/testdata/downloads/
       sed -i 's/-mno-stack-arg-probe/-mno-stack-arg-probe -fno-stack-clash-protection -fomit-frame-pointer -momit-leaf-frame-pointer -O0/g' native/CMakeLists.txt
@@ -167,6 +194,9 @@ let
       "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
       "-DRAVEN_VK_XML=${pkgs.vulkan-headers}/share/vulkan/registry/vk.xml"
       "-DRAVEN_VULKAN_CORE_HEADER=${pkgs.vulkan-headers}/include/vulkan/vulkan_core.h"
+      "-DPNG_LIBRARY_RELEASE=${components.libpng}/lib/libpng16.a"
+      "-DPNG_LIBRARY_DEBUG=${components.libpng}/lib/libpng16.a"
+      "-DPNG_PNG_INCLUDE_DIR=${components.libpng}/include"
     ]
     ++ lib.optionals withControls [
       "-DRAVEN_CONTROLS_COMPONENT_DIR=${components.controls64}"
@@ -179,8 +209,8 @@ let
       "-DRAVEN_ROOT_CERTIFICATE_DIRECTORY=${components.roots}"
     ]
     ++ lib.optionals withGraphics [
-      "-DRAVEN_DXVK_PE64_DIR=${components.dxvk64}/bin"
-      "-DRAVEN_DXVK_PE32_DIR=${components.dxvk32}/bin"
+      "-DRAVEN_DXVK_PE64_DIR=${components.dxvk64}"
+      "-DRAVEN_DXVK_PE32_DIR=${components.dxvk32}"
       "-DRAVEN_VKD3D_PE64_DIR=${components.vkd3d}/pe64"
     ]
     ++ lib.optionals withSqlite [
@@ -213,6 +243,7 @@ let
       mkdir -p $out/libexec/raven/x86 $out/bin
 
       install -Dm755 "$runtime/raven" $out/libexec/raven/raven
+      install -Dm755 "$runtime/raven-runtime" $out/libexec/raven/raven-runtime
       install -Dm755 "$runtime/raven-bootstrap" $out/libexec/raven/raven-bootstrap
 
       copy_component() {
@@ -239,14 +270,27 @@ let
         install -Dm644 "$runtime/x86/l_intl.nls" $out/libexec/raven/x86/l_intl.nls
       fi
 
+      if [ -d "$runtime/WinMetadata" ]; then
+        mkdir -p $out/libexec/raven/WinMetadata
+        for metadata in "$runtime"/WinMetadata/*.winmd; do
+          install -Dm644 "$metadata" $out/libexec/raven/WinMetadata/$(basename "$metadata")
+        done
+      fi
+
+      ${lib.optionalString withGraphics ''
+        for library in ${components.dxvk64}/*.dll ${components.vkd3d}/pe64/*.dll; do
+          install -Dm755 "$library" $out/libexec/raven/$(basename "$library")
+        done
+      ''}
+
       mkdir -p $out/libexec/raven/roots
       for certificate in ${components.roots}/*.crt; do
         install -Dm644 "$certificate" $out/libexec/raven/roots/$(basename "$certificate")
       done
 
-      ${lib.optionalString withFonts ''
+      ${lib.optionalString (withFonts || withSkia) ''
         mkdir -p $out/libexec/raven/fonts
-        for font in ${components.fonts}/*.ttf; do
+        for font in ${components.fonts}/*; do
           install -Dm644 "$font" $out/libexec/raven/fonts/$(basename "$font")
         done
         ln -s ${components.fonts} $out/libexec/raven/fonts-source
@@ -261,6 +305,9 @@ let
       done
 
       ln -s ../libexec/raven/raven $out/bin/raven
+
+      python3 ${src}/nix/check-runtime-contract.py --build "$PWD" --out $out --source ${src} \
+        --manifest $out/libexec/raven/runtime-contract.txt
 
       runHook postInstall
     '';

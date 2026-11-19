@@ -12,6 +12,8 @@ let
     [
       cmake
       ninja
+      cargo
+      rustc
       python3
       pkg-config
       clang
