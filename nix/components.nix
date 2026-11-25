@@ -8,8 +8,8 @@
 let
   inherit (pkgs) fetchurl;
 
-  mingw64 = pkgsCross.mingwW64.stdenv.cc;
-  mingw32 = pkgsCross.mingw32.stdenv.cc;
+  mingw64 = pkgsCross."mingw-msvcrt-x86_64".stdenv.cc;
+  mingw32 = pkgsCross."mingw-msvcrt-i686".stdenv.cc;
 
   mingwHeadersSource = fetchurl {
     name = "mingw-w64-14.0.0.tar.bz2";

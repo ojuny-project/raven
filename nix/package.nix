@@ -20,8 +20,8 @@ let
 
   version = "0-unstable-2026-11-19";
 
-  mingw64 = pkgs.pkgsCross.mingwW64.stdenv.cc;
-  mingw32 = pkgs.pkgsCross.mingw32.stdenv.cc;
+  mingw64 = pkgs.pkgsCross."mingw-msvcrt-x86_64".stdenv.cc;
+  mingw32 = pkgs.pkgsCross."mingw-msvcrt-i686".stdenv.cc;
 
   cargoDeps = pkgs.rustPlatform.importCargoLock {
     lockFile = ../native/waits/Cargo.lock;
