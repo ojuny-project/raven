@@ -134,6 +134,7 @@ let
     cp ${cert "MicrosoftRootCert.crt" "http://www.microsoft.com/pki/certs/MicrosoftRootCert.crt" "sha256-iF3mTDQOPqcGWPAeEUX5V/zaJ6q+6hq5+qn9sBAtQHc="} $out/MicrosoftRootCert.crt
     cp ${cert "MicRooCerAut_2010-06-23.crt" "http://www.microsoft.com/pki/certs/MicRooCerAut_2010-06-23.crt" "sha256-31Rb+RmiQ5w2mDtUzfyQPfpPN9OZbY2EtMMe7G88Fj4="} $out/MicRooCerAut_2010-06-23.crt
     cp ${cert "MicRooCerAut2011_2011_03_22.crt" "http://www.microsoft.com/pki/certs/MicRooCerAut2011_2011_03_22.crt" "sha256-hH32p4SXlD8n/HLrk/mmNzIKArVh0KkbCeh6eAftfGE="} $out/MicRooCerAut2011_2011_03_22.crt
+    cp ${cert "MicrosoftIdentityVerificationRootCA2020.crt" "http://www.microsoft.com/pkiops/certs/Microsoft%20Identity%20Verification%20Root%20Certificate%20Authority%202020.crt" "sha256-U2fyDHreDivKeQkVBW0Ia3IMM8H6KiZhrPeH4ykuEnA="} $out/MicrosoftIdentityVerificationRootCA2020.crt
   '';
 
   fixtures = pkgs.runCommand "raven-fixture-downloads" { } ''
