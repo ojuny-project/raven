@@ -17,14 +17,39 @@
             inherit (pkgs) lib;
             inherit pkgs;
           };
+          ravenLog = pkgs.writeShellApplication {
+            name = "raven";
+            runtimeInputs = [
+              pkgs.coreutils
+              ravenPackages.raven
+            ];
+            text = ''
+              log="''${XDG_STATE_HOME:-''${HOME:-/tmp}/.local/state}/ojuny/raven/last-exit.log"
+              mkdir -p "$(dirname "$log")"
+              exec 3>"$log"
+              status=0
+              raven --exit-code-fd 3 "$@" || status=$?
+              exec 3>&-
+              guest="$(cat "$log" 2>/dev/null || true)"
+              printf 'raven: host exit %s, guest exit %s\n' "$status" "''${guest:-unknown}" >&2
+              exit "$status"
+            '';
+          };
         in
         {
-          default = ravenPackages.raven;
+          default = ravenLog;
           inherit (ravenPackages) raven raven-unwrapped;
+          inherit ravenLog;
         }
       );
 
-      devShells = eachSystem (pkgs: import ./nix/devshell.nix { inherit (pkgs) lib; inherit pkgs; });
+      devShells = eachSystem (
+        pkgs:
+        import ./nix/devshell.nix {
+          inherit (pkgs) lib;
+          inherit pkgs;
+        }
+      );
 
       checks = eachSystem (
         pkgs:
