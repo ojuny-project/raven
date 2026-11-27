@@ -86,6 +86,7 @@ constexpr std::array shared_exports{
 	NativeX86System::Export{"kernel32.dll", "GetPhysicallyInstalledSystemMemory", 1},
 	NativeX86System::Export{"ws2_32.dll", "WSASendMsg", 6}, NativeX86System::Export{"ws2_32.dll", "WSARecvMsg", 5},
 	NativeX86System::Export{"ntdll.dll", "NtQueryDirectoryFile", 11}, NativeX86System::Export{"ntdll.dll", "ZwQueryDirectoryFile", 11},
+	NativeX86System::Export{"ntdll.dll", "NtPowerInformation", 5}, NativeX86System::Export{"ntdll.dll", "ZwPowerInformation", 5},
 	NativeX86System::Export{"kernel32.dll", "CreateDirectoryW", 2}, NativeX86System::Export{"kernel32.dll", "CreateFileA", 7},
 	NativeX86System::Export{"kernel32.dll", "CreateEventExA", 4}, NativeX86System::Export{"kernel32.dll", "CreateEventExW", 4},
 	NativeX86System::Export{"kernel32.dll", "GetCPInfoExA", 3}, NativeX86System::Export{"kernel32.dll", "GetCPInfoExW", 3},
@@ -94,6 +95,9 @@ constexpr std::array shared_exports{
 	NativeX86System::Export{"kernel32.dll", "GetSystemTimeAsFileTime", 1}, NativeX86System::Export{"kernel32.dll", "GetTempPathA", 2},
 	NativeX86System::Export{"kernel32.dll", "GetTickCount64", 0}, NativeX86System::Export{"kernel32.dll", "LocalFree", 1},
 	NativeX86System::Export{"kernel32.dll", "MapViewOfFile", 5}, NativeX86System::Export{"kernel32.dll", "UnmapViewOfFile", 1},
+	NativeX86System::Export{"kernel32.dll", "PathCchAppend", 3}, NativeX86System::Export{"kernel32.dll", "PathCchCombineEx", 5},
+	NativeX86System::Export{"kernel32.dll", "GetAppContainerNamedObjectPath", 5},
+	NativeX86System::Export{"ntdll.dll", "RtlGetAppContainerNamedObjectPath", 4},
 	NativeX86System::Export{"user32.dll", "AllowSetForegroundWindow", 1},
 	NativeX86System::Export{"user32.dll", "PeekMessageA", 5},
 	NativeX86System::Export{"user32.dll", "CallWindowProcA", 5}, NativeX86System::Export{"user32.dll", "DestroyCursor", 1},
@@ -299,23 +303,7 @@ bool kernel_string_api(NativeProcess &process, NativeEnvironment &environment, c
 	const NativeLaunch &launch, std::string_view name)
 {
 	if (name == "GetTickCount" || name == "timeGetTime") {
-		const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch());
-		process.return_api(uint32_t(now.count()));
-		return true;
-	}
-	if (name == "ProcessIdToSessionId") {
-		// Only the process itself is known, and it runs in the interactive session.
-		const auto args = process.api_arguments(2);
-		const auto own = process.read_memory(environment.teb() + 0x20, 4);
-		const uint32_t own_id = own[0] | uint32_t(own[1]) << 8 | uint32_t(own[2]) << 16 | uint32_t(own[3]) << 24;
-		if (uint32_t(args[0]) != own_id || !args[1]) {
-			environment.set_last_error(87);
-			process.return_api(0);
-			return true;
-		}
-		const uint8_t session[4] = {1, 0, 0, 0};
-		process.write_memory(args[1], session);
-		process.return_api(1);
+		process.return_api(uint32_t(shared_tick_count()));
 		return true;
 	}
 	if (name == "timeBeginPeriod" || name == "timeEndPeriod") {
@@ -424,7 +412,7 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 		// The system's libraries are the runtime's whatever copies the program ships or an installer left in the system directory, except those a
 		// copy in the program's folder may replace.
 		std::vector<std::string_view> provided;
-		for (const std::string_view library : {"kernel32.dll", "user32.dll", "gdi32.dll", "advapi32.dll", "setupapi.dll", "msvcrt.dll", "winmm.dll",
+		for (const std::string_view library : {"kernel32.dll", "kernelbase.dll", "user32.dll", "gdi32.dll", "advapi32.dll", "setupapi.dll", "msvcrt.dll", "winmm.dll",
 			"dsound.dll", "vulkan-1.dll", "shell32.dll", "comctl32.dll", "ntdll.dll", "version.dll", "ole32.dll"})
 			if (!program_may_replace(library))
 				provided.push_back(library);
@@ -450,6 +438,7 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 	std::set<std::string> unknown_names;
 	{
 		std::set<std::string> system_libraries(system_library_names().begin(), system_library_names().end());
+		system_libraries.insert("kernelbase.dll");
 		system_libraries.insert("usp10.dll");
 		system_libraries.insert("ntdll.dll");
 		for (const auto &[module_name, module] : modules.all())
@@ -485,7 +474,7 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 	const auto with_imports = [&](const std::string &library, std::span<const std::string_view> own) {
 		std::vector<std::string_view> merged(own.begin(), own.end());
 		// A library loaded later, such as an installer plug-in, imports names the initial graph never named: every public name binds.
-		const auto published = system_export_names(library);
+		const auto published = system_export_names(library == "kernelbase.dll" ? "kernel32.dll" : library);
 		merged.insert(merged.end(), published.begin(), published.end());
 		if (const auto found = imported_names.find(library); found != imported_names.end())
 			for (const auto &name : found->second)
@@ -496,7 +485,7 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 	};
 	// The stdcall argument words of a function: the library's own decorated symbol first, then what Raven's tables say.
 	const auto words_of = [](const std::string &library, std::string_view name, uint32_t fallback) {
-		const auto authoritative = system_export_words(library, name);
+		const auto authoritative = system_export_words(library == "kernelbase.dll" ? "kernel32.dll" : library, name);
 		if (authoritative != UINT32_MAX)
 			return authoritative;
 		return fallback;
@@ -550,13 +539,14 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 		std::vector<std::string_view> own(implemented.begin(), implemented.end());
 		own.insert(own.end(), pending.begin(), pending.end());
 		const auto exports = with_imports(dll, own);
-		const auto size = PEImage(runtime_provider(dll, 0x70000000ULL, exports, true)).image_size;
+		const auto ordinals = system_export_ordinals(dll);
+		const auto size = PEImage(runtime_provider(dll, 0x70000000ULL, exports, true, {}, ordinals)).image_size;
 		const auto base = provider_base(modules, size);
-		auto &provider = modules.add(dll, runtime_provider(dll, base, exports, true), base);
+		auto &provider = modules.add(dll, runtime_provider(dll, base, exports, true, {}, ordinals), base);
 		provider.runtime_api = true;
 		overlay(provider, dll);
 		for (const auto &symbol : provider.exports) {
-			if (!symbol.forwarder.empty())
+			if (symbol.names.empty() || !symbol.forwarder.empty())
 				continue;
 			const auto &exported = symbol.names.at(0);
 			const auto view = std::find(exports.begin(), exports.end(), exported);
@@ -664,6 +654,10 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 			traps.emplace(provider.loaded.base() + symbol.address, std::pair{name, words_of(dll, exported, count(exported)) * 4});
 		}
 	};
+	add_library("kernelbase.dll", {}, {}, [](std::string_view name) {
+		const auto words = registry_words(name);
+		return words == UINT32_MAX ? 0 : words;
+	});
 	std::vector<std::string_view> advapi_names;
 	for (const auto &item : host_exports("advapi32.dll"))
 		advapi_names.push_back(item.name);
@@ -768,6 +762,7 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 		add_library(library.c_str(), {}, {}, [](std::string_view name) { return registry_words(name) != UINT32_MAX ? registry_words(name) : uint32_t(0); },
 			system_export_ordinals(library));
 	}
+	const auto import_probes = add_import_probes(modules, true);
 	alias_api_sets(modules);
 	modules.bind_imports();
 	std::vector<LoadedImage *> images;
@@ -777,6 +772,8 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 	NativeProcess process(images, bootstrap, timeout, NativeMode::x86, entry.image.stack_reserve);
 	for (const auto &[address, api] : traps)
 		process.add_api_trap(address, api.second);
+	for (const auto &[address, name] : import_probes)
+		process.add_api_trap(address, 0);
 	// Stubs of exports forwarded to a component keep their breakpoint; trapping them lets callers that read the export table directly
 	// reach the component's implementation with their own stack frame intact.
 	std::unordered_map<uint64_t, uint64_t> forwarded_traps;
@@ -884,11 +881,16 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 		started_modules.erase(&module);
 		memory.remove_image(module.loaded.base());
 	});
-	library_loader.set_started([&started_modules](PEModule &module, bool started) {
-		if (started)
+	// Notes each library the loader unloads in the kernel's trace (KernelContext::unloads), once the kernel is there.
+	std::function<void(const PEModule &)> note_unload;
+	library_loader.set_started([&started_modules, &note_unload](PEModule &module, bool started) {
+		if (started) {
 			started_modules.insert(&module);
-		else
+		} else {
 			started_modules.erase(&module);
+			if (note_unload)
+				note_unload(module);
+		}
 	});
 	if (launch) {
 		const auto separator = launch->image_path.find_last_of(u'\\');
@@ -1123,8 +1125,10 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 				continue;
 			}
 			const auto found = traps.find(result.value);
-			if (found == traps.end())
+			if (found == traps.end()) {
+				trace_import_probe(import_probes, modules, process, result.value, true);
 				return result;
+			}
 			const auto api = found->second.first;
 			if (getenv("RAVEN_TRACE_X86")) {
 				std::ostringstream line;
@@ -1272,6 +1276,7 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 			// component: the call goes on there with the same arguments, so handlers that resume elsewhere, as a C++ catch does, never return
 			// to the runtime. The vectored handler lists live there too, and fibers, which the thread switches by itself.
 			static const std::map<std::string_view, std::string_view> in_runtime{{"RaiseException", "raven_raise_exception"},
+				{"DebugBreak", "raven_debug_break"},
 				{"RtlUnwind", "raven_unwind"}, {"AddVectoredExceptionHandler", "raven_add_vectored_exception"},
 				{"RtlAddVectoredExceptionHandler", "raven_add_vectored_exception"},
 				{"AddVectoredContinueHandler", "raven_add_vectored_continue"}, {"RtlAddVectoredContinueHandler", "raven_add_vectored_continue"},
@@ -1303,7 +1308,8 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 						return std::find(symbol.names.begin(), symbol.names.end(), wanted) != symbol.names.end();
 					});
 					if (found != exports.end()) {
-						if (api == "RtlUnwind")
+						// A call of DebugBreak is a new breakpoint, not a handler that came back to the last one.
+						if (api == "RtlUnwind" || api == "DebugBreak")
 							fault_loops[guest_threads.current_id()].rounds = 0;
 						auto native = process.context();
 						native.registers.rip = component->second->loaded.base() + found->address;
@@ -1474,9 +1480,17 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 	GuestAllocator allocator(memory, guest_heap);
 	compat.set_global_blocks([&allocator](uint64_t address) { return allocator.size(address); }, [&allocator](uint64_t address) { return allocator.release(address); });
 	KernelContext kernel{process, environment, memory, allocator, kernel_objects, guest_threads, paths, modules, entry, *launch, invoke};
+	note_unload = [&process, &allocator, unloads = kernel.unloads](const PEModule &module) {
+		unloads->record(process, allocator, false, module.loaded.base(), module.image.image_size,
+			module.file.empty() ? module.name : module.file.filename().string());
+	};
 	guest_threads.set_watched([reactor = kernel.reactor](std::vector<pollfd> &descriptors) { reactor->watch(descriptors); });
+	kernel.reactor->set_watch_added([&guest_threads](int descriptor, short events) { guest_threads.watch_added(descriptor, events); });
 	// Waits that also wake for messages ask the window system, and the window system sleeps as the scheduler does.
 	kernel.queue_status = [&windows](uint32_t thread,uint32_t mask,bool clear) { return windows.queue_status(thread,mask,clear); };
+	kernel.present_frames = [&windows] { return windows.present_frames(); };
+	// Another process's message wakes a waiting thread when it lands, not at its next look.
+	set_foreign_nudge(guest_threads.remote_nudge());
 	kernel.module_named = [&module_api](uint64_t address, bool wide) { return module_api.module_handle(address, wide); };
 	windows.set_idle_sources([&guest_threads](std::chrono::steady_clock::time_point limit) { return guest_threads.idle_until(limit); },
 		[&guest_threads](std::vector<pollfd> &descriptors) { guest_threads.idle_descriptors(descriptors); }, [&guest_threads] { guest_threads.drain_wake(); });
@@ -1500,6 +1514,7 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 	register_security_api(shared_api, kernel);
 	register_child_process_api(shared_api, kernel);
 	register_winsock_api(shared_api, kernel);
+	register_alpc_api(shared_api, kernel);
 #ifdef RAVEN_OPENSSL
 	register_wininet_api(shared_api, kernel);
 #endif
@@ -1510,6 +1525,7 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 	register_bcrypt_api(shared_api, kernel);
 	register_process_info_api(shared_api, kernel);
 	register_font_service(shared_api, kernel);
+	register_canvas_service(shared_api, kernel);
 	register_sandbox_api(shared_api, kernel);
 	register_shader_service(shared_api, kernel);
 	register_audio_service(shared_api, kernel);

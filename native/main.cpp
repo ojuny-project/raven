@@ -5,6 +5,7 @@
 #ifdef RAVEN_NATIVE_CPU
 #include "cpu/native_cpu.h"
 #include "nt/providers.h"
+#include "nt/loader.h"
 #include "nt/paths.h"
 #include "nt/launch.h"
 #include "nt/actctx.h"
@@ -13,11 +14,13 @@
 #include "nt/snapshot.h"
 #include "nt/apps.h"
 #include "nt/confine.h"
+#include "nt/link.h"
 #include "nt/sandbox.h"
 #include "nt/handle_channel.h"
 #include "nt/text.h"
 #include "nt/system_exports.h"
 #include "nt/warm_host.h"
+#include "nt/clock_calibration.h"
 #ifdef RAVEN_OPENGL
 #include "graphics/opengl_bridge.h"
 #endif
@@ -50,6 +53,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <stdexcept>
 
 #ifdef RAVEN_NATIVE_CPU
@@ -89,7 +93,7 @@ static raven::ModuleBytes map_module(const std::filesystem::path &path)
 #endif
 	auto bytes = raven::ModuleBytes::map(path);
 	if (!bytes)
-		throw std::runtime_error("cannot map PE file: " + path.string());
+		throw std::runtime_error("cannot map PE file: " + path.string() + ": " + std::strerror(errno));
 	if (std::span<const uint8_t>(*bytes).size() > 0xffffffffULL)
 		throw std::runtime_error("PE file exceeds inspection size limit");
 	return std::move(*bytes);
@@ -182,8 +186,22 @@ static void show_fault(int signal)
 	std::raise(signal);
 }
 
+// The time a run without a limit of its own may last, a century: every wait the runtime makes ends by then, and the time stays well
+// within the steady clock's range wherever it is added to the present.
+static constexpr std::chrono::milliseconds unlimited_run{std::chrono::hours(24 * 365 * 100)};
+
 int main(int argc, char **argv)
 {
+	// A Windows program keeps as many files, pipes and sockets open as it needs, far past the soft limit a session may start programs
+	// with: the limit is raised as far as the hard limit lets it, for this process and every one it starts.
+	if (rlimit files{}; ::getrlimit(RLIMIT_NOFILE, &files) == 0 && files.rlim_cur < files.rlim_max) {
+		files.rlim_cur = files.rlim_max;
+		::setrlimit(RLIMIT_NOFILE, &files);
+	}
+#ifdef RAVEN_NATIVE_CPU
+	// The guest's clock is calibrated from here to when the guest starts.
+	raven::clock_origin();
+#endif
 	if (std::getenv("RAVEN_BACKTRACE")) {
 		std::set_terminate(show_backtrace);
 		std::signal(SIGSEGV, show_fault);
@@ -259,7 +277,7 @@ int main(int argc, char **argv)
 	bool wayland=false,x11=false;
 	bool inherited_stdio=false;
 	// A program started by another one carries the command line and the directory its parent chose.
-	std::optional<std::string> command_line_text, directory_text;
+	std::optional<std::string> command_line_text, directory_text, app_user_model_id;
 	int environment_fd=-1,suspended_fd=-1,inherit_fd=-1,handle_channel_fd=-1,guest_error_fd=2;
 	bool elevated=false,noninteractive=false;
 	for (bool more=run_process;more && argc>first_file;) {
@@ -268,8 +286,10 @@ int main(int argc, char **argv)
 			const std::string_view value=option.substr(13);
 			uint64_t milliseconds=0;
 			const auto parsed=std::from_chars(value.data(),value.data()+value.size(),milliseconds);
-			if (parsed.ec!=std::errc{} || parsed.ptr!=value.data()+value.size() || milliseconds<1 || milliseconds>86400000) {
-				std::cerr << "raven: native timeout must be 1..86400000 milliseconds\n";
+			// "none" is a program that runs for as long as it is used, as a plugin a host keeps loaded: the run has no limit of its own.
+			if (value=="none") milliseconds=uint64_t(unlimited_run.count());
+			else if (parsed.ec!=std::errc{} || parsed.ptr!=value.data()+value.size() || milliseconds<1 || milliseconds>86400000) {
+				std::cerr << "raven: native timeout must be 1..86400000 milliseconds or none\n";
 				return 2;
 			}
 			timeout=std::chrono::milliseconds(milliseconds);
@@ -280,6 +300,7 @@ int main(int argc, char **argv)
 		else if (option=="--stdio=inherit") inherited_stdio=true;
 		else if (option.starts_with("--command-line=")) command_line_text=std::string(option.substr(15));
 		else if (option.starts_with("--directory=")) directory_text=std::string(option.substr(12));
+		else if (option.starts_with("--app-user-model-id=")) app_user_model_id=std::string(option.substr(20));
 		else if (option.starts_with("--environment-fd=")) environment_fd=std::atoi(std::string(option.substr(17)).c_str());
 		else if (option.starts_with("--suspended-fd=")) {
 			suspended_fd=std::atoi(std::string(option.substr(15)).c_str());
@@ -287,6 +308,14 @@ int main(int argc, char **argv)
 		}
 		else if (option.starts_with("--inherit-fd=")) inherit_fd=std::atoi(std::string(option.substr(13)).c_str());
 		else if (option.starts_with("--handle-channel-fd=")) handle_channel_fd=std::atoi(std::string(option.substr(20)).c_str());
+		else if (option.starts_with("--host-broker-fd=")) raven::adopt_host_broker(std::atoi(std::string(option.substr(17)).c_str()));
+		// Memory the program starting the runtime shares with the Windows program, which maps it through ravenhost.dll's RavenLinkMap.
+		else if (option.starts_with("--link-fd=")) {
+			if (!raven::adopt_link(std::atoi(std::string(option.substr(10)).c_str()))) {
+				std::cerr << "raven: --link-fd must name a descriptor of shared memory\n";
+				return 2;
+			}
+		}
 		else if (option.starts_with("--diagnostics-fd=")) {
 			// The runtime's own messages go where the parent runtime writes its own; the program's standard error moves out of their way
 			// to a descriptor of its own, so nothing the runtime says ever lands in a pipe the program reads.
@@ -316,7 +345,7 @@ int main(int argc, char **argv)
 	}
 	// What programs it starts inherit: how long they may run and which window system they use.
 	const auto pass_options=[&] {
-		std::string options="--timeout-ms="+std::to_string(timeout.count());
+		std::string options="--timeout-ms="+(timeout==unlimited_run ? std::string("none") : std::to_string(timeout.count()));
 		if (wayland) options+=" --desktop=wayland";
 		if (x11) options+=" --desktop=x11";
 		setenv("RAVEN_CHILD_OPTIONS",options.c_str(),1);
@@ -338,7 +367,7 @@ int main(int argc, char **argv)
 			<< "       raven --bind-imports program.exe dependency.dll ...\n"
 			<< "       raven --run-entry --execution=native fixture.exe\n"
 			<< "       raven --run-modules --execution=native fixture.exe dependency.dll ...\n"
-			<< "       raven --run-process --execution=native [--timeout-ms=N] [--desktop=wayland|--desktop=x11] [--stdio=inherit] program.exe [dependency.dll ...] [-- guest-argument ...]\n"
+			<< "       raven --run-process --execution=native [--timeout-ms=N|none] [--desktop=wayland|--desktop=x11] [--stdio=inherit] program.exe [dependency.dll ...] [-- guest-argument ...]\n"
 			<< "Complete Windows process initialization is not implemented yet.\n";
 		return 2;
 	}
@@ -474,6 +503,9 @@ int main(int argc, char **argv)
 									std::filesystem::remove(entry.path(), error);
 							}
 						}
+						// The desktop's entries for the addresses the prefix takes from it, written again at each start: the runtime may have moved.
+						if (handle_channel_fd < 0 && !std::getenv("RAVEN_PREFIX_SETUP"))
+							raven::sandbox().publish_links();
 						// The classes the runtime's components serve are registered in the prefix, as Windows ships them registered: regsvr32 runs
 						// for each width when the components changed since the prefix last registered them. The runs themselves skip this step.
 						const char *servers[] = {"oleaut32.dll", "msxml3.dll", "windowscodecs.dll", "mlang.dll", "propsys.dll"};
@@ -696,34 +728,12 @@ int main(int argc, char **argv)
 							if (std::filesystem::exists(component))
 								return read_module(component.c_str());
 						}
-						// DirectWrite, Direct2D and Windows Animation are the runtime's own components too: the library names resolve to them.
-						if (!selected && (name=="dwrite.dll" || name=="d2d1.dll" || name=="uianimation.dll") && entry->image.is_64) {
-							const auto component = std::filesystem::read_symlink("/proc/self/exe").parent_path() /
-								(name=="dwrite.dll" ? "raven-dwrite.dll" : name=="d2d1.dll" ? "raven-d2d1.dll" : "raven-uianimation.dll");
-							if (std::filesystem::exists(component))
-								return read_module(component.c_str());
-						}
-						// The Direct3D libraries a Windows installation provides come from RAVEN_D3D_DIRECTORY (one or more directories separated by
-						// colons, such as a DXVK build and a vkd3d-proton build of the program's width) or from beside the runtime.
-						if (!selected && (name=="dxgi.dll" || name=="d3d11.dll" || name=="d3d10core.dll" || name=="d3d10_1.dll" || name=="d3d9.dll" || name=="d3d8.dll" ||
-							name=="d3d12.dll" || name=="d3d12core.dll")) {
-							std::vector<std::filesystem::path> places;
-							if (const char *directories = std::getenv("RAVEN_D3D_DIRECTORY"))
-								for (std::string_view rest = directories; !rest.empty();) {
-									const auto colon = rest.find(':');
-									if (const auto part = rest.substr(0, colon); !part.empty())
-										places.emplace_back(std::string(part));
-									rest = colon == rest.npos ? std::string_view() : rest.substr(colon + 1);
-								}
-							places.emplace_back(std::filesystem::read_symlink("/proc/self/exe").parent_path());
-							for (const auto &place : places)
-								if (std::filesystem::exists(place / name))
-									return read_module((place / name).c_str());
-							// Direct3D 10.1 is the runtime's own library over the d3d10core.dll found here, when no build carries one.
-							if (name=="d3d10_1.dll")
-								if (const auto component = component_directory / "raven-d3d10_1.dll"; std::filesystem::exists(component))
-									return read_module(component.c_str());
-						}
+						if (!selected)
+							if (const auto component = raven::graphics_component(name, entry->image.is_64))
+								return read_module(component->c_str());
+						if (!selected)
+							if (const auto component = raven::configured_d3d_library(name, entry->image.is_64))
+								return read_module(component->c_str());
 						// Then the system directory, where installers put the libraries programs share. The system's own libraries are the
 						// runtime's whatever files there carry their names.
 						const auto system_names = raven::system_library_names();
@@ -916,6 +926,7 @@ int main(int argc, char **argv)
 						launch->suspended_fd = suspended_fd;
 						if (command_line_text) launch->command_line=raven::from_utf8(*command_line_text);
 						if (directory_text) launch->directory=raven::from_utf8(*directory_text);
+						if (app_user_model_id) launch->app_user_model_id=raven::from_utf8(*app_user_model_id);
 						if (handle_channel_fd>=0) raven::set_parent_channel(handle_channel_fd);
 						if (inherit_fd>=0) {
 							// The handles the creator passed on arrive as descriptors, described in an anonymous file.

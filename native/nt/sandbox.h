@@ -29,7 +29,7 @@ public:
 
 	// Reads the prefix's sandbox.conf, and again whenever it changes. A line "read PATH" or "write PATH" grants a path to every program,
 	// "app-read PROGRAM<tab>PATH" and "app-write PROGRAM<tab>PATH" to one program, and "network off" or "app-network-off PROGRAM" take
-	// the network away.
+	// the network away. A line "link SCHEME" lets the Linux desktop hand the prefix SCHEME: addresses (see publish_links).
 	void load(const std::filesystem::path &prefix);
 	// The program this runtime runs, by the Windows path of its executable, which the grants of one program are matched against.
 	void set_program(std::u16string program);
@@ -69,11 +69,29 @@ public:
 	// Who opens a kind of file (".txt") or of address ("mailto"): a line "handler KIND<tab>windows", "handler KIND<tab>linux:NAME" or
 	// "handler KIND<tab>ask"; empty when no line names it, and a program of the prefix opens it then.
 	std::string handler(std::string_view kind) const;
+	// The kinds of address the desktop may hand the prefix, by their "link" lines.
+	std::vector<std::string> links() const;
+	// The printers the prefix shows its programs: a line "printer NAME<tab>TARGET" passes each job sent to NAME, unchanged (as a RAW
+	// job), to TARGET: "file:/folder" saves each job as a file there, "cups:QUEUE" hands it to that Linux print queue as raw data.
+	struct Printer {
+		std::string name, target;
+	};
+	std::vector<Printer> printers() const;
+	// The serial ports the prefix shows its programs: a line "serial COM1<tab>/dev/ttyUSB0" opens that Linux device for COM1. Empty when
+	// no line names the port.
+	std::string serial_device(std::u16string_view port) const;
+	// A desktop entry (x-scheme-handler/SCHEME) for each kind of address the prefix lets the desktop hand it that a program of the prefix
+	// registered (HKEY_CLASSES_ROOT\SCHEME with a "URL Protocol" value), and none for the others. Its command opens the address in the
+	// prefix with rundll32's ShellExec_RunDLL, as ShellExecute opens it there, with this runtime's window system.
+	void publish_links() const;
 	// The access another program of the prefix has: the program that started this one, whose files a bridge to a Linux program passes on.
 	Access access_as(const std::filesystem::path &host, std::u16string_view other) const;
 	// Opens host files and addresses with a Linux program the prefix exposes, for the program that started this one: only what that
 	// program reaches. False when the program is not exposed or a path is refused.
 	bool open_on_host(std::string_view name, const std::vector<std::string> &targets) const;
+	// What open_on_host does on the host, for the program `caller`; with `own`, only what this runtime's own program reaches as well,
+	// for a runtime started inside its confinement that names its caller.
+	bool launch_on_host(std::string_view name, const std::vector<std::string> &targets, std::u16string_view caller, bool own) const;
 	// The launch options a child runtime needs to keep the grants of this run.
 	std::vector<std::string> child_options() const;
 
@@ -87,6 +105,9 @@ private:
 	mutable bool network_allowed = true;
 	mutable std::vector<HostApp> exposed;
 	mutable std::vector<std::pair<std::string, std::string>> handlers;
+	mutable std::vector<std::string> schemes;
+	mutable std::vector<Printer> printer_lines;
+	mutable std::vector<std::pair<std::string, std::string>> serial_lines;
 	mutable timespec configuration_time{};
 	mutable off_t configuration_size = -1;
 };

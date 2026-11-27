@@ -28,6 +28,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+#include <poll.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -383,6 +386,62 @@ static std::shared_ptr<FileObject> plain_file(NativeObjects &objects, ApiCall &c
 	return file;
 }
 
+// ---- COM ports on Linux serial devices (sandbox.conf "serial COM1<tab>/dev/ttyUSB0") ----
+
+// The COM port a device name names ("COM1", "\\.\COM12"), upper case; empty for other names.
+static std::u16string com_port_name(std::u16string_view name)
+{
+	for (const std::u16string_view prefix : {u"\\\\.\\", u"\\\\?\\", u"\\??\\"})
+		if (name.starts_with(prefix))
+			name.remove_prefix(prefix.size());
+	if (name.size() < 4 || name.size() > 6 || !equal_fold(name.substr(0, 3), u"COM"))
+		return {};
+	for (const auto character : name.substr(3))
+		if (character < u'0' || character > u'9')
+			return {};
+	std::u16string upper = u"COM";
+	upper += name.substr(3);
+	return upper;
+}
+
+static speed_t serial_speed(uint32_t baud)
+{
+	switch (baud) {
+	case 110: return B110; case 300: return B300; case 600: return B600; case 1200: return B1200; case 2400: return B2400;
+	case 4800: return B4800; case 19200: return B19200; case 38400: return B38400; case 57600: return B57600;
+	case 115200: return B115200; case 230400: return B230400; default: return B9600;
+	}
+}
+
+static uint32_t serial_baud(speed_t speed)
+{
+	switch (speed) {
+	case B110: return 110; case B300: return 300; case B600: return 600; case B1200: return 1200; case B2400: return 2400;
+	case B4800: return 4800; case B19200: return 19200; case B38400: return 38400; case B57600: return 57600;
+	case B115200: return 115200; case B230400: return 230400; default: return 9600;
+	}
+}
+
+// Bytes waiting to be read on a serial descriptor.
+static uint32_t serial_waiting(int descriptor)
+{
+	int count = 0;
+	return ::ioctl(descriptor, FIONREAD, &count) == 0 && count > 0 ? uint32_t(count) : 0;
+}
+
+// Reads what is there now, at most `size` bytes, without waiting (the descriptor is non-blocking).
+static ssize_t serial_take(int descriptor, std::vector<uint8_t> &buffer, size_t size)
+{
+	buffer.resize(size);
+	ssize_t count;
+	do count = ::read(descriptor, buffer.data(), size); while (count < 0 && errno == EINTR);
+	if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+		count = 0;
+	if (count >= 0)
+		buffer.resize(size_t(count));
+	return count;
+}
+
 static void read_beside(NativeObjects &objects, ApiCall &call)
 {
 	const auto file = plain_file(objects, call);
@@ -460,6 +519,106 @@ void register_file_api(ApiRegistry &registry, KernelContext &context)
 	auto &paths = context.paths;
 	auto &objects = context.objects;
 	const auto file_of = [&](uint64_t handle) { return objects.object_as<FileObject>(handle); };
+
+	// ReadFile on a COM port: the COMMTIMEOUTS decide when it returns. MAXDWORD/0/0 returns what is there; MAXDWORD/MAXDWORD/c returns as
+	// soon as a byte is there, waiting up to c ms (.NET's "infinite" -2 waits without end); otherwise multiplier * size + constant ms
+	// for the whole count, 0 meaning no limit. An overlapped handle that must wait completes later, from the reactor, when bytes come.
+	const auto read_serial = [&](ApiCall &call, const std::shared_ptr<FileObject> &file) {
+		const uint32_t wanted = call.u32(2);
+		if (std::getenv("RAVEN_TRACE_SERIAL"))
+			std::fprintf(stderr, "serial: ReadFile %u bytes, overlapped %d, waiting %u, timeouts %x/%x/%x\n", wanted, call[4] ? 1 : 0,
+				serial_waiting(file->descriptor), file->serial->timeouts[0], file->serial->timeouts[1], file->serial->timeouts[2]);
+		const uint64_t buffer = call[1], overlapped = call[4];
+		const size_t width = call.pointer_width();
+		const bool asynchronous = (file->flags & 0x40000000U) && overlapped;
+		if (call[3]) call.store<uint32_t>(call[3], 0);
+		else if (!overlapped) return call.fail(87);
+		uint32_t timeouts[5];
+		{
+			std::lock_guard guard(file->serial->lock);
+			std::memcpy(timeouts, file->serial->timeouts, sizeof timeouts);
+		}
+		constexpr uint32_t most = 0xFFFFFFFFU;
+		const bool immediate = timeouts[0] == most && timeouts[1] == 0 && timeouts[2] == 0;
+		const bool any = timeouts[0] == most && timeouts[1] == most && timeouts[2] && timeouts[2] != most;
+		std::optional<std::chrono::steady_clock::time_point> deadline;
+		if (any && timeouts[2] < 0xFFFFFFFEU)
+			deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeouts[2]);
+		else if (!any && !immediate)
+			if (const uint64_t total = uint64_t(timeouts[1]) * wanted + timeouts[2])
+				deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(total);
+		auto got = std::make_shared<std::vector<uint8_t>>();
+		const int descriptor = file->descriptor;
+		const auto more = [descriptor, wanted, got] {
+			std::vector<uint8_t> chunk;
+			if (got->size() < wanted && serial_take(descriptor, chunk, wanted - got->size()) > 0)
+				got->insert(got->end(), chunk.begin(), chunk.end());
+		};
+		const auto enough = [wanted, got, any] { return got->size() == wanted || (any && !got->empty()); };
+		more();
+		if (!immediate && !enough() && !asynchronous) {
+			HostWait waiting;
+			context.threads.block([&] { more(); return enough(); }, deadline, false, true);
+		}
+		if (immediate || enough() || !asynchronous) {
+			call.write(buffer, *got);
+			if (call[3]) call.store<uint32_t>(call[3], uint32_t(got->size()));
+			if (asynchronous)
+				complete_file_io(context, *file, overlapped, width, 0, got->size());
+			else if (overlapped) {
+				call.store_pointer(overlapped, 0);
+				call.store_pointer(overlapped + width, got->size());
+			}
+			return call.ret(1);
+		}
+		call.store_pointer(overlapped, 0x103);
+		call.store_pointer(overlapped + width, 0);
+		std::weak_ptr<FileObject> handle = file;
+		context.reactor->add([&context = context, handle, more, enough, got, buffer, overlapped, width]() {
+			const auto file = handle.lock();
+			if (!file) {
+				return true;
+			}
+			more();
+			if (!enough())
+				return false;
+			context.process.write_memory(buffer, *got);
+			finish_pending_io(context, file->port, file->key, overlapped, width, 0, got->size());
+			return true;
+		}, descriptor, short(POLLIN));
+		call.fail(997, 0);  // ERROR_IO_PENDING
+	};
+	// WriteFile on a COM port: all of it, waiting while the device's queue is full.
+	const auto write_serial = [&](ApiCall &call, const std::shared_ptr<FileObject> &file) {
+		const uint64_t overlapped = call[4];
+		const size_t width = call.pointer_width();
+		if (call[3]) call.store<uint32_t>(call[3], 0);
+		else if (!overlapped) return call.fail(87);
+		const auto bytes = call.read(call[1], call.u32(2));
+		if (std::getenv("RAVEN_TRACE_SERIAL"))
+			std::fprintf(stderr, "serial: WriteFile %zu bytes\n", bytes.size());
+		size_t sent = 0;
+		for (int stalls = 0; sent < bytes.size() && stalls < 200;) {
+			const auto count = ::write(file->descriptor, bytes.data() + sent, bytes.size() - sent);
+			if (count > 0) {
+				sent += size_t(count);
+				continue;
+			}
+			if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+				return call.fail(error_of(errno));
+			pollfd ready{file->descriptor, POLLOUT, 0};
+			::poll(&ready, 1, 10);
+			stalls++;
+		}
+		if (call[3]) call.store<uint32_t>(call[3], uint32_t(sent));
+		if (overlapped && (file->flags & 0x40000000U))
+			complete_file_io(context, *file, overlapped, width, 0, sent);
+		else if (overlapped) {
+			call.store_pointer(overlapped, 0);
+			call.store_pointer(overlapped + width, sent);
+		}
+		call.ret(1);
+	};
 	// Host errors become Windows last errors; a missing parent directory reads as path-not-found.
 	const auto resolve = [&](ApiCall &call, std::u16string_view name) -> std::optional<NativePaths::Resolved> {
 		const auto resolved = paths.resolve(name);
@@ -494,6 +653,40 @@ void register_file_api(ApiRegistry &registry, KernelContext &context)
 			return;
 		}
 		if (NativePaths::device(name)) {
+			if (const auto port = com_port_name(name); !port.empty()) {
+				const auto device = sandbox().serial_device(port);
+				if (device.empty()) {
+					call.fail(2, invalid_handle);  // ERROR_FILE_NOT_FOUND: no such port, as on a machine without it
+					return;
+				}
+				const int descriptor = ::open(device.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+				if (descriptor < 0) {
+					call.fail(errno == EBUSY ? 5 : errno == ENOENT ? 2 : error_of(errno), invalid_handle);
+					return;
+				}
+				// Raw bytes at 9600 8N1 until the program sets its own state.
+				termios mode{};
+				if (::tcgetattr(descriptor, &mode) == 0) {
+					::cfmakeraw(&mode);
+					mode.c_cflag |= CLOCAL | CREAD;
+					::cfsetispeed(&mode, B9600);
+					::cfsetospeed(&mode, B9600);
+					::tcsetattr(descriptor, TCSANOW, &mode);
+				}
+				// A port opens with its queues empty, as Windows' serial driver starts them: nothing sent before the open is read.
+				::tcflush(descriptor, TCIOFLUSH);
+				if (std::getenv("RAVEN_TRACE_SERIAL"))
+					std::fprintf(stderr, "serial: opened %s for %s, flags %x\n", device.c_str(), to_utf8(port).c_str(), flags);
+				auto file = std::make_shared<FileObject>(descriptor, access, false, device, port, flags);
+				file->serial = std::make_shared<SerialPort>();
+				const auto made = objects.add_object(file);
+				if (!made.status && inheritable_handle(call, security))
+					objects.set_inherit(made.value, true);
+				call.ret(made.status ? invalid_handle : made.value);
+				if (!made.status)
+					call.set_last_error(0);
+				return;
+			}
 			if (open_console_device(context, call, name, access, inheritable_handle(call, security)))
 				return;
 			const int descriptor = ::open("/dev/null", O_RDWR | O_CLOEXEC);
@@ -606,15 +799,20 @@ void register_file_api(ApiRegistry &registry, KernelContext &context)
 		}
 		create_file(call, file->dos_path, call.u32(1), 3, call.u32(3), 0);
 	});
-	registry.add("ReadFile", 5, [&, resolve, missing, file_of](ApiCall &call) {
+	registry.add("ReadFile", 5, [&, resolve, missing, file_of, read_serial](ApiCall &call) {
 		if (call.alone) {
 			read_beside(objects, call);
 			return;
 		}
 		if (transfer_pipe(context, call, true) || read_console_file(context, call))
 			return;
-		// The standard handles inherited from the host read straight from their descriptors.
+		// The standard handles inherited from the host read straight from their descriptors. A pipe or a socket waits for its data with
+		// the runtime given up, as the program's other threads go on meanwhile.
 		if (!file_of(call[0])) {
+			struct stat kind{};
+			if (const int descriptor = objects.descriptor(call[0]);
+				descriptor >= 0 && !::fstat(descriptor, &kind) && (S_ISFIFO(kind.st_mode) || S_ISSOCK(kind.st_mode)))
+				context.threads.wait_descriptor(descriptor, POLLIN, std::nullopt);
 			std::vector<uint8_t> buffer(std::min<uint32_t>(call.u32(2), 1 << 20));
 			const auto result = objects.read_file(call[0], buffer);
 			if (!result.status && !call[4]) {
@@ -627,6 +825,10 @@ void register_file_api(ApiRegistry &registry, KernelContext &context)
 		const auto file = file_of(call[0]);
 		if (!file || file->directory || !file->readable()) {
 			call.fail(file && file->directory ? 5 : file ? 5 : 6);
+			return;
+		}
+		if (file->serial) {
+			read_serial(call, file);
 			return;
 		}
 		if (call[3]) call.store<uint32_t>(call[3], 0);
@@ -662,7 +864,7 @@ void register_file_api(ApiRegistry &registry, KernelContext &context)
 		}
 		call.ret(1);
 	});
-	registry.add("WriteFile", 5, [&, resolve, missing, file_of](ApiCall &call) {
+	registry.add("WriteFile", 5, [&, resolve, missing, file_of, write_serial](ApiCall &call) {
 		if (call.alone) {
 			write_beside(objects, call);
 			return;
@@ -672,6 +874,10 @@ void register_file_api(ApiRegistry &registry, KernelContext &context)
 		const auto file = file_of(call[0]);
 		if (!file || file->directory || !file->writable()) {
 			call.fail(file ? 5 : 6);
+			return;
+		}
+		if (file->serial) {
+			write_serial(call, file);
 			return;
 		}
 		if (call[3]) call.store<uint32_t>(call[3], 0);
@@ -1467,6 +1673,15 @@ void register_file_api(ApiRegistry &registry, KernelContext &context)
 			// Zero leaves a time as it is; the change time is the host's to keep.
 			const auto bytes = call.read(call[2], 36);
 			const auto time_at = [&](size_t at) { int64_t value; std::memcpy(&value, bytes.data() + at, 8); return value; };
+			// Attributes that are zero stay too. A file the program may change takes the read-only flag as SetFileAttributesW gives it,
+			// through a handle that may write attributes; a folder keeps its permissions.
+			uint32_t attributes;
+			std::memcpy(&attributes, bytes.data() + 32, 4);
+			const bool flagged = attributes && !file->directory;
+			if (flagged && (!paths.changeable(file->path) || !(file->access & (0x100U | 0x40000000U | 0x10000000U)))) {
+				call.fail(5);
+				return;
+			}
 			timespec times[2] = {{0, UTIME_OMIT}, {0, UTIME_OMIT}};
 			const auto convert = [](int64_t value, timespec &out) {
 				if (value <= 0)
@@ -1477,6 +1692,12 @@ void register_file_api(ApiRegistry &registry, KernelContext &context)
 			convert(time_at(8), times[0]);
 			convert(time_at(16), times[1]);
 			if ((times[0].tv_nsec != UTIME_OMIT || times[1].tv_nsec != UTIME_OMIT) && ::futimens(file->descriptor, times)) {
+				call.fail(error_of(errno));
+				return;
+			}
+			struct stat metadata{};
+			if (flagged && (::fstat(file->descriptor, &metadata) ||
+					::fchmod(file->descriptor, attributes & attribute_readonly ? metadata.st_mode & 07555 : (metadata.st_mode & 07777) | 0200))) {
 				call.fail(error_of(errno));
 				return;
 			}
@@ -1589,6 +1810,8 @@ void register_file_api(ApiRegistry &registry, KernelContext &context)
 	registry.add("SetCachedSigningLevel", 4, [file_of](ApiCall &call) {
 		call.fail(file_of(call[3]) ? 50 : 6);
 	});
+	// What a file is, asked by its name alone, is not offered, as on a file system without that path: the caller opens the file.
+	registry.add("GetFileInformationByName", 4, [](ApiCall &call) { call.fail(50); });
 	registry.add("GetFileInformationByHandleEx", 4, [&, resolve, missing, file_of, query_directory](ApiCall &call) {
 		// The directory classes read a directory's entries as NtQueryDirectoryFile does, in the record of the matching native class:
 		// FileIdBothDirectoryInfo (10), FileFullDirectoryInfo (14) and FileIdExtdDirectoryInfo (19), and their restarting forms.
@@ -1689,6 +1912,9 @@ void register_file_api(ApiRegistry &registry, KernelContext &context)
 	registry.add("GetFileAttributesW", 1, [&, resolve, missing, file_of](ApiCall &call) {
 		call.ret(UINT32_MAX);
 		const auto name = call.wide(call[0]);
+		// Beside the turn (see beside_api) only a path found without what the turn changes.
+		if (call.alone && !paths.resolves_alone(name))
+			throw ApiNeedsTurn{};
 		const auto resolved = resolve(call, name);
 		struct stat metadata{};
 		if (!resolved)
@@ -1698,12 +1924,12 @@ void register_file_api(ApiRegistry &registry, KernelContext &context)
 			return;
 		}
 		struct stat own{};
-		if (!resolved->exists || ::lstat(resolved->host.c_str(), &own)) {
+		if (!resolved->exists || paths.status(resolved->host, own, false)) {
 			call.set_last_error(missing(*resolved));
 			return;
 		}
 		const bool link = S_ISLNK(own.st_mode);
-		if (!link || ::stat(resolved->host.c_str(), &metadata))
+		if (!link || paths.status(resolved->host, metadata, true))
 			metadata = own;
 		call.set_last_error(0);
 		call.ret(attributes_of(metadata, resolved->host) | (link ? attribute_reparse : 0));
@@ -2351,6 +2577,35 @@ void register_file_api(ApiRegistry &registry, KernelContext &context)
 		call.write(call[2], std::span<const uint8_t>(bytes.data(), written));
 		finish(written < bytes.size() ? buffer_overflow : 0, written);
 	});
+	// NtSetInformationFile changes what SetFileInformationByHandle changes, for the classes libuv sets: FileBasicInformation,
+	// FileDispositionInformation, FileEndOfFileInformation and FileDispositionInformationEx, each with its class there and the size of
+	// its record. The result is the status, and the last error stays as it was.
+	registry.add("NtSetInformationFile", 5, [&registry](ApiCall &call) {
+		constexpr uint32_t invalid_class = 0xc0000003U, length_mismatch = 0xc0000004U;
+		struct Class { uint32_t native, win32, size; };
+		static constexpr Class classes[] = {{4, 0, 40}, {13, 4, 1}, {20, 6, 8}, {64, 21, 4}};
+		const auto known = std::find_if(std::begin(classes), std::end(classes), [&](const Class &entry) { return entry.native == call.u32(4); });
+		if (known == std::end(classes) || call.u32(3) < known->size) {
+			call.ret(known == std::end(classes) ? invalid_class : length_mismatch);
+			return;
+		}
+		const uint32_t before = call.last_error();
+		uint32_t status = 0;
+		// A record or a status block that is not the program's memory is an access violation.
+		try {
+			ApiCall inner(call.process, call.environment, {call[0], known->win32, call[2], call[3]});
+			registry.find("SetFileInformationByHandle")->second(inner);
+			status = inner.result ? 0 : status_from_error(call.last_error());
+			if (!status && call[1]) {
+				call.store_pointer(call[1], 0);
+				call.store_pointer(call[1] + call.pointer_width(), 0);
+			}
+		} catch (const ApiFault &) {
+			status = 0xc0000005U;
+		}
+		call.set_last_error(before);
+		call.ret(status);
+	});
 	// GetTempFileName: a zero unique value picks a free name and creates the file; any other value only forms the name.
 	registry.add("GetTempFileNameW", 4, [&, resolve, missing, file_of, copy_file](ApiCall &call) {
 		const auto directory = call.wide(call[0]);
@@ -2726,6 +2981,247 @@ void register_file_api(ApiRegistry &registry, KernelContext &context)
 		}, watch->descriptor, short(POLLIN));
 		call.ret(1);
 	});
+	// ---- the comm functions, for COM ports opened on serial devices ----
+	const auto serial_of = [&, file_of](ApiCall &call) -> std::shared_ptr<FileObject> {
+		if (std::getenv("RAVEN_TRACE_SERIAL"))
+			std::fprintf(stderr, "serial: %s(%llx)\n", api_in_progress ? api_in_progress : "?", static_cast<unsigned long long>(call[0]));
+		auto file = file_of(call[0]);
+		if (!file || !file->serial) {
+			call.fail(6);  // ERROR_INVALID_HANDLE
+			return nullptr;
+		}
+		return file;
+	};
+	// DCB: DCBlength, BaudRate, the flag bits, wReserved, XonLim, XoffLim, ByteSize, Parity, StopBits, XonChar, XoffChar, ErrorChar,
+	// EofChar, EvtChar, wReserved1: 28 bytes.
+	registry.add("GetCommState", 2, [&, serial_of](ApiCall &call) {
+		const auto file = serial_of(call);
+		if (!file) return;
+		std::vector<uint8_t> dcb;
+		{
+			std::lock_guard guard(file->serial->lock);
+			dcb = file->serial->dcb;
+		}
+		if (dcb.size() != 28) {
+			dcb.assign(28, 0);
+			termios mode{};
+			::tcgetattr(file->descriptor, &mode);
+			const uint32_t length = 28, baud = serial_baud(::cfgetospeed(&mode)), flags = 1 | (1 << 4) | (1 << 12);
+			std::memcpy(&dcb[0], &length, 4);
+			std::memcpy(&dcb[4], &baud, 4);
+			std::memcpy(&dcb[8], &flags, 4);
+			const auto size = mode.c_cflag & CSIZE;
+			dcb[18] = size == CS5 ? 5 : size == CS6 ? 6 : size == CS7 ? 7 : 8;
+			dcb[19] = !(mode.c_cflag & PARENB) ? 0 : (mode.c_cflag & PARODD) ? 1 : 2;
+			dcb[20] = (mode.c_cflag & CSTOPB) ? 2 : 0;
+			dcb[21] = 0x11;
+			dcb[22] = 0x13;
+		}
+		call.write(call[1], dcb);
+		call.ret(1);
+	});
+	registry.add("SetCommState", 2, [&, serial_of](ApiCall &call) {
+		const auto file = serial_of(call);
+		if (!file) return;
+		auto dcb = call.read(call[1], 28);
+		uint32_t baud = 0, flags = 0;
+		std::memcpy(&baud, &dcb[4], 4);
+		std::memcpy(&flags, &dcb[8], 4);
+		if (dcb[18] < 5 || dcb[18] > 8 || dcb[19] > 4 || dcb[20] > 2)
+			return call.fail(87);
+		termios mode{};
+		if (::tcgetattr(file->descriptor, &mode) == 0) {
+			::cfmakeraw(&mode);
+			mode.c_cflag |= CLOCAL | CREAD;
+			mode.c_cflag &= ~(CSIZE | PARENB | PARODD | CSTOPB | CRTSCTS);
+			mode.c_cflag |= dcb[18] == 5 ? CS5 : dcb[18] == 6 ? CS6 : dcb[18] == 7 ? CS7 : CS8;
+			if (dcb[19] == 1 || dcb[19] == 2)
+				mode.c_cflag |= PARENB | (dcb[19] == 1 ? PARODD : 0);
+			if (dcb[20])
+				mode.c_cflag |= CSTOPB;
+			if (flags & (1 << 2))
+				mode.c_cflag |= CRTSCTS;
+			mode.c_iflag &= ~(IXON | IXOFF);
+			if (flags & (1 << 8)) mode.c_iflag |= IXON;
+			if (flags & (1 << 9)) mode.c_iflag |= IXOFF;
+			::cfsetispeed(&mode, serial_speed(baud));
+			::cfsetospeed(&mode, serial_speed(baud));
+			::tcsetattr(file->descriptor, TCSANOW, &mode);
+		}
+		std::lock_guard guard(file->serial->lock);
+		file->serial->dcb = std::move(dcb);
+		call.ret(1);
+	});
+	registry.add("GetCommTimeouts", 2, [&, serial_of](ApiCall &call) {
+		const auto file = serial_of(call);
+		if (!file) return;
+		std::lock_guard guard(file->serial->lock);
+		call.write(call[1], std::span<const uint8_t>(reinterpret_cast<const uint8_t *>(file->serial->timeouts), 20));
+		call.ret(1);
+	});
+	registry.add("SetCommTimeouts", 2, [&, serial_of](ApiCall &call) {
+		const auto file = serial_of(call);
+		if (!file) return;
+		const auto values = call.read(call[1], 20);
+		std::lock_guard guard(file->serial->lock);
+		std::memcpy(file->serial->timeouts, values.data(), 20);
+		call.ret(1);
+	});
+	registry.add("SetCommMask", 2, [&, serial_of](ApiCall &call) {
+		const auto file = serial_of(call);
+		if (!file) return;
+		std::lock_guard guard(file->serial->lock);
+		file->serial->mask = call.u32(1);
+		call.ret(1);
+	});
+	registry.add("GetCommMask", 2, [&, serial_of](ApiCall &call) {
+		const auto file = serial_of(call);
+		if (!file) return;
+		std::lock_guard guard(file->serial->lock);
+		call.store<uint32_t>(call[1], file->serial->mask);
+		call.ret(1);
+	});
+	// WaitCommEvent(hFile, lpEvtMask, lpOverlapped): EV_RXCHAR (1) when bytes are waiting; the other events never come here. A wait on an
+	// overlapped handle completes from the reactor; SetCommMask(0) or closing the handle ends it with no event.
+	registry.add("WaitCommEvent", 3, [&, serial_of](ApiCall &call) {
+		const auto file = serial_of(call);
+		if (!file) return;
+		const uint64_t events = call[1], overlapped = call[2];
+		const size_t width = call.pointer_width();
+		const auto port = file->serial;
+		const int descriptor = file->descriptor;
+		uint32_t mask;
+		{
+			std::lock_guard guard(port->lock);
+			mask = port->mask;
+		}
+		if (!mask)
+			return call.fail(87);
+		const auto arrived = [port, descriptor] {
+			std::lock_guard guard(port->lock);
+			return !port->mask || ((port->mask & 1) && serial_waiting(descriptor));
+		};
+		const auto report = [port, descriptor] {
+			std::lock_guard guard(port->lock);
+			return (port->mask & 1) && serial_waiting(descriptor) ? 1U : 0U;
+		};
+		const bool asynchronous = (file->flags & 0x40000000U) && overlapped;
+		if (!asynchronous && !arrived()) {
+			HostWait waiting;
+			context.threads.block(arrived, std::nullopt, false, true);
+		}
+		if (arrived()) {
+			if (events) call.store<uint32_t>(events, report());
+			if (asynchronous)
+				complete_file_io(context, *file, overlapped, width, 0, 0);
+			return call.ret(1);
+		}
+		call.store_pointer(overlapped, 0x103);
+		call.store_pointer(overlapped + width, 0);
+		std::weak_ptr<FileObject> handle = file;
+		context.reactor->add([&context = context, handle, arrived, report, events, overlapped, width]() {
+			const auto file = handle.lock();
+			if (!file)
+				return true;
+			if (!arrived())
+				return false;
+			const uint32_t value = report();
+			if (events)
+				context.process.write_memory(events, std::span<const uint8_t>(reinterpret_cast<const uint8_t *>(&value), 4));
+			finish_pending_io(context, file->port, file->key, overlapped, width, 0, 0);
+			return true;
+		}, descriptor, short(POLLIN));
+		call.fail(997, 0);
+	});
+	// ClearCommError(hFile, lpErrors, lpStat): no errors; COMSTAT { flags, cbInQue, cbOutQue }.
+	registry.add("ClearCommError", 3, [&, serial_of](ApiCall &call) {
+		const auto file = serial_of(call);
+		if (!file) return;
+		if (call[1]) call.store<uint32_t>(call[1], 0);
+		if (call[2]) {
+			int out = 0;
+			::ioctl(file->descriptor, TIOCOUTQ, &out);
+			call.store<uint32_t>(call[2], 0);
+			call.store<uint32_t>(call[2] + 4, serial_waiting(file->descriptor));
+			call.store<uint32_t>(call[2] + 8, out > 0 ? uint32_t(out) : 0);
+		}
+		call.ret(1);
+	});
+	registry.add("PurgeComm", 2, [&, serial_of](ApiCall &call) {
+		const auto file = serial_of(call);
+		if (!file) return;
+		const auto flags = call.u32(1);
+		const bool input = flags & 0xA, output = flags & 0x5;  // PURGE_RXABORT|PURGE_RXCLEAR, PURGE_TXABORT|PURGE_TXCLEAR
+		if (input || output)
+			::tcflush(file->descriptor, input && output ? TCIOFLUSH : input ? TCIFLUSH : TCOFLUSH);
+		call.ret(1);
+	});
+	registry.add("SetupComm", 3, [&, serial_of](ApiCall &call) {
+		if (serial_of(call)) call.ret(1);
+	});
+	// EscapeCommFunction: SETRTS 3, CLRRTS 4, SETDTR 5, CLRDTR 6, SETBREAK 8, CLRBREAK 9. A device without modem lines (a pseudo
+	// terminal) takes them as done.
+	registry.add("EscapeCommFunction", 2, [&, serial_of](ApiCall &call) {
+		const auto file = serial_of(call);
+		if (!file) return;
+		int bits = 0;
+		switch (call.u32(1)) {
+		case 3: bits = TIOCM_RTS; ::ioctl(file->descriptor, TIOCMBIS, &bits); break;
+		case 4: bits = TIOCM_RTS; ::ioctl(file->descriptor, TIOCMBIC, &bits); break;
+		case 5: bits = TIOCM_DTR; ::ioctl(file->descriptor, TIOCMBIS, &bits); break;
+		case 6: bits = TIOCM_DTR; ::ioctl(file->descriptor, TIOCMBIC, &bits); break;
+		case 8: ::ioctl(file->descriptor, TIOCSBRK); break;
+		case 9: ::ioctl(file->descriptor, TIOCCBRK); break;
+		case 1: case 2: case 7: break;  // SETXOFF, SETXON, RESETDEV
+		default: return call.fail(87);
+		}
+		call.ret(1);
+	});
+	for (const auto *name : {"SetCommBreak", "ClearCommBreak"}) {
+		const bool set = name[0] == 'S';
+		registry.add(name, 1, [&, serial_of, set](ApiCall &call) {
+			const auto file = serial_of(call);
+			if (!file) return;
+			::ioctl(file->descriptor, set ? TIOCSBRK : TIOCCBRK);
+			call.ret(1);
+		});
+	}
+	// GetCommModemStatus: MS_CTS_ON 0x10, MS_DSR_ON 0x20, MS_RING_ON 0x40, MS_RLSD_ON 0x80.
+	registry.add("GetCommModemStatus", 2, [&, serial_of](ApiCall &call) {
+		const auto file = serial_of(call);
+		if (!file) return;
+		int lines = 0;
+		uint32_t status = 0;
+		if (::ioctl(file->descriptor, TIOCMGET, &lines) == 0)
+			status = ((lines & TIOCM_CTS) ? 0x10 : 0) | ((lines & TIOCM_DSR) ? 0x20 : 0) | ((lines & TIOCM_RI) ? 0x40 : 0) |
+				((lines & TIOCM_CD) ? 0x80 : 0);
+		if (call[1]) call.store<uint32_t>(call[1], status);
+		call.ret(1);
+	});
+	// GetCommProperties: an RS-232 port (PST_RS232) with the usual capabilities.
+	registry.add("GetCommProperties", 2, [&, serial_of](ApiCall &call) {
+		const auto file = serial_of(call);
+		if (!file) return;
+		std::vector<uint8_t> properties(64, 0);
+		const auto put16 = [&](size_t at, uint16_t value) { std::memcpy(&properties[at], &value, 2); };
+		const auto put32 = [&](size_t at, uint32_t value) { std::memcpy(&properties[at], &value, 4); };
+		put16(0, 64);              // wPacketLength
+		put16(2, 2);               // wPacketVersion
+		put32(4, 1);               // dwServiceMask: SP_SERIALCOMM
+		put32(12, 4096);           // dwMaxTxQueue
+		put32(16, 4096);           // dwMaxRxQueue
+		put32(20, 0x10000000);     // dwMaxBaud: BAUD_USER
+		put32(24, 1);              // dwProvSubType: PST_RS232
+		put32(28, 0xFF);           // dwProvCapabilities
+		put32(32, 0x7F);           // dwSettableParams
+		put32(36, 0x1006FFFF);     // dwSettableBaud
+		put16(40, 0xF);            // wSettableData: 5 to 8 bits
+		put16(42, 0x1F07);         // wSettableStopParity
+		put32(44, 4096);           // dwCurrentTxQueue
+		put32(48, 4096);           // dwCurrentRxQueue
+		call.write(call[1], properties);
+		call.ret(1);
+	});
 	registry.add("GetDriveTypeW", 1, [&, resolve, missing, file_of, copy_file, find_first](ApiCall &call) {
 		// DRIVE_FIXED for the prefix's drives, DRIVE_NO_ROOT_DIR for letters without a mapping. Z: shows the host's whole file system, a
 		// share rather than a disk of this machine: DRIVE_REMOTE, so installers looking for the fixed disk with the most room stay off it.
@@ -2844,15 +3340,18 @@ void register_file_api(ApiRegistry &registry, KernelContext &context)
 		}
 		// The current-thread pseudo handle duplicates into a real handle to the calling thread; the current-process one into the process itself.
 		std::optional<uint32_t> narrowed = typed_rights;
-		const bool section = objects.object_as<SectionObject>(call[1]) != nullptr;
-		if (section && !(call.u32(6) & same_access)) {
+		const bool section = std::dynamic_pointer_cast<SectionObject>(source) != nullptr;
+		const auto type = source ? source->type_name() : std::u16string_view();
+		const bool scoped_access = section || type == u"IoCompletion" || type == u"IoCompletionReserve" ||
+			type == u"WaitCompletionPacket" || type == u"ALPC Port";
+		if (scoped_access && !(call.u32(6) & same_access)) {
 			// A copy cannot carry rights the original lacks; asking for them is refused.
 			const uint32_t held = objects.access_of(call[1]);
 			uint32_t wanted = call.u32(4);
 			if (wanted & (0x10000000U | 0x02000000U))
 				wanted = held;
 			if (wanted & ~held) {
-				if (std::getenv("RAVEN_TRACE_FAIL"))
+				if (section && std::getenv("RAVEN_TRACE_FAIL"))
 					std::fprintf(stderr, "raven: section handle %llx holds %x, a copy asked for %x\n", (unsigned long long)call[1], held, wanted);
 				call.fail(5);
 				return;

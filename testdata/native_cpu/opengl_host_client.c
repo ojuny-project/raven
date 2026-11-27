@@ -106,6 +106,53 @@ static int pixel(int x, int y, unsigned char r, unsigned char g, unsigned char b
 	return matches;
 }
 
+// Vertices a game keeps in its own memory, as Windows draws them: a draw reads only the vertices it uses, from where the arrays point
+// at the time of the draw.
+static int client_arrays(void)
+{
+	// Two quads, and the draw takes the second, so the copy must begin where the draw does.
+	const float positions[] = {9, 9, 9, 9, 9, 9, 9, 9, -1, -1, 1, -1, 1, 1, -1, 1};
+	unsigned char colours[32] = {0};
+	for (unsigned index = 16; index < 32; index += 4) {
+		colours[index] = 255; colours[index + 2] = 255; colours[index + 3] = 255;
+	}
+	glClearColor(0, 0, 0, 1);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glEnableClientState(GL_VERTEX_ARRAY);
+	glEnableClientState(GL_COLOR_ARRAY);
+	glVertexPointer(2, GL_FLOAT, 0, positions);
+	glColorPointer(4, GL_UNSIGNED_BYTE, 0, colours);
+	glDrawArrays(GL_QUADS, 4, 4);
+	if (glGetError() || !pixel(16, 16, 255, 0, 255)) return 91;
+	// Interleaved vertices, drawn through indices that are in the game's memory as well.
+	struct vertex { float x, y; unsigned char r, g, b, a; } vertices[8];
+	for (unsigned index = 0; index < 8; ++index) {
+		vertices[index].x = index < 4 ? 9 : positions[index * 2];
+		vertices[index].y = index < 4 ? 9 : positions[index * 2 + 1];
+		vertices[index].r = 0; vertices[index].g = 255; vertices[index].b = 255; vertices[index].a = 255;
+	}
+	const unsigned short indices[] = {4, 5, 6, 7};
+	glVertexPointer(2, GL_FLOAT, sizeof(struct vertex), &vertices[0].x);
+	glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(struct vertex), &vertices[0].r);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glDrawElements(GL_QUADS, 4, GL_UNSIGNED_SHORT, indices);
+	if (glGetError() || !pixel(16, 16, 0, 255, 255)) return 92;
+	// What the game writes between draws is what the next draw shows.
+	for (unsigned index = 4; index < 8; ++index) { vertices[index].r = 255; vertices[index].b = 0; }
+	glClear(GL_COLOR_BUFFER_BIT);
+	glDrawElements(GL_QUADS, 4, GL_UNSIGNED_SHORT, indices);
+	if (glGetError() || !pixel(16, 16, 255, 255, 0)) return 93;
+	// An array at memory the game cannot read fails the draw as any unreadable pointer does, and nothing is drawn.
+	glVertexPointer(2, GL_FLOAT, 0, (void *)8);
+	glClear(GL_COLOR_BUFFER_BIT);
+	SetLastError(0);
+	glDrawArrays(GL_QUADS, 0, 4);
+	if (GetLastError() != ERROR_NOACCESS || glGetError() || !pixel(16, 16, 0, 0, 0)) return 94;
+	glDisableClientState(GL_COLOR_ARRAY);
+	glDisableClientState(GL_VERTEX_ARRAY);
+	return 0;
+}
+
 static int game_features(void)
 {
 #define GL_PROC(result, name, arguments) result (WINAPI *name) arguments = (void *)wglGetProcAddress(#name); if (!name) return 35
@@ -202,6 +249,172 @@ static int game_features(void)
 	if (gluUnProject(8, 16, .25, unity, unity, viewport, coordinates + 1, (void *)1, coordinates + 3) ||
 		GetLastError() != ERROR_NOACCESS || coordinates[1] != -.5 || coordinates[3] != -.5) return 46;
 	glLoadIdentity(); glMatrixMode(GL_MODELVIEW);
+	return 0;
+}
+
+// What a game gets from a 3.3 compatibility context beyond the calls above: attribute stacks, state queries that write as many values as
+// their name asks for, buffer mapping, instanced and ranged draws, queries, fences and vectors of values. Windows exports the 1.1 calls
+// from opengl32 and hands out the rest through wglGetProcAddress.
+static int compatibility_profile(void)
+{
+	HMODULE opengl = GetModuleHandleA("opengl32.dll");
+#define GL_CORE(result, name, arguments) result (WINAPI *name##_) arguments = (void *)GetProcAddress(opengl, #name); if (!name##_) return 96
+#define GL_PROC(result, name, arguments) result (WINAPI *name##_) arguments = (void *)wglGetProcAddress(#name); if (!name##_) return 97
+	GL_CORE(void, glPushAttrib, (GLbitfield));
+	GL_CORE(void, glPopAttrib, (void));
+	GL_CORE(void, glGetBooleanv, (GLenum, GLboolean *));
+	GL_CORE(void, glTexParameterfv, (GLenum, GLenum, const GLfloat *));
+	GL_CORE(void, glGetTexParameterfv, (GLenum, GLenum, GLfloat *));
+	GL_PROC(void, glBufferSubData, (GLenum, ptrdiff_t, ptrdiff_t, const void *));
+	GL_PROC(void, glGetBufferSubData, (GLenum, ptrdiff_t, ptrdiff_t, void *));
+	GL_PROC(void *, glMapBufferRange, (GLenum, ptrdiff_t, ptrdiff_t, GLbitfield));
+	GL_PROC(void *, glMapBuffer, (GLenum, GLenum));
+	GL_PROC(GLboolean, glUnmapBuffer, (GLenum));
+	GL_PROC(void, glGenBuffers, (GLsizei, GLuint *));
+	GL_PROC(void, glBindBuffer, (GLenum, GLuint));
+	GL_PROC(void, glBufferData, (GLenum, ptrdiff_t, const void *, GLenum));
+	GL_PROC(void, glDeleteBuffers, (GLsizei, const GLuint *));
+	GL_PROC(void, glDrawArraysInstanced, (GLenum, GLint, GLsizei, GLsizei));
+	GL_PROC(void, glDrawRangeElements, (GLenum, GLuint, GLuint, GLsizei, GLenum, const void *));
+	GL_PROC(void, glVertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void *));
+	GL_PROC(void, glVertexAttribDivisor, (GLuint, GLuint));
+	GL_PROC(void, glEnableVertexAttribArray, (GLuint));
+	GL_PROC(void, glDisableVertexAttribArray, (GLuint));
+	GL_PROC(GLuint, glCreateShader, (GLenum));
+	GL_PROC(void, glShaderSource, (GLuint, GLsizei, const char *const *, const GLint *));
+	GL_PROC(void, glCompileShader, (GLuint));
+	GL_PROC(GLuint, glCreateProgram, (void));
+	GL_PROC(void, glAttachShader, (GLuint, GLuint));
+	GL_PROC(void, glBindAttribLocation, (GLuint, GLuint, const char *));
+	GL_PROC(void, glLinkProgram, (GLuint));
+	GL_PROC(void, glUseProgram, (GLuint));
+	GL_PROC(GLint, glGetUniformLocation, (GLuint, const char *));
+	GL_PROC(void, glUniform4fv, (GLint, GLsizei, const GLfloat *));
+	GL_PROC(void, glGetUniformfv, (GLuint, GLint, GLfloat *));
+	GL_PROC(void, glGetActiveUniform, (GLuint, GLuint, GLsizei, GLsizei *, GLint *, GLenum *, char *));
+	GL_PROC(GLint, glGetAttribLocation, (GLuint, const char *));
+	GL_PROC(void, glDeleteProgram, (GLuint));
+	GL_PROC(void, glDeleteShader, (GLuint));
+	GL_PROC(void, glGenQueries, (GLsizei, GLuint *));
+	GL_PROC(void, glBeginQuery, (GLenum, GLuint));
+	GL_PROC(void, glEndQuery, (GLenum));
+	GL_PROC(void, glGetQueryObjectuiv, (GLuint, GLenum, GLuint *));
+	GL_PROC(void, glDeleteQueries, (GLsizei, const GLuint *));
+	GL_PROC(void *, glFenceSync, (GLenum, GLbitfield));
+	GL_PROC(GLboolean, glIsSync, (void *));
+	GL_PROC(GLenum, glClientWaitSync, (void *, GLbitfield, uint64_t));
+	GL_PROC(void, glDeleteSync, (void *));
+#undef GL_PROC
+#undef GL_CORE
+	// The attribute stack, as the game saves its viewport around a pass.
+	GLint viewport[6] = {123, 0, 0, 0, 0, 456}, changed[4];
+	glGetIntegerv(GL_VIEWPORT, viewport + 1);
+	glPushAttrib_(GL_VIEWPORT_BIT);
+	glViewport(1, 2, 3, 4);
+	glGetIntegerv(GL_VIEWPORT, changed);
+	glPopAttrib_();
+	GLint restored[4];
+	glGetIntegerv(GL_VIEWPORT, restored);
+	if (glGetError() || viewport[0] != 123 || viewport[5] != 456 || changed[0] != 1 || changed[3] != 4 || restored[2] != viewport[3]) return 98;
+	// A query writes the values its name has and nothing past them.
+	GLboolean mask[6] = {7, 7, 7, 7, 7, 7};
+	glGetBooleanv_(GL_COLOR_WRITEMASK, mask + 1);
+	if (glGetError() || mask[0] != 7 || mask[5] != 7 || mask[1] != GL_TRUE || mask[4] != GL_TRUE) return 99;
+	GLint limit[3] = {123, 0, 456};
+	glGetIntegerv(0x80e8, limit + 1);
+	if (glGetError() || limit[0] != 123 || limit[2] != 456 || limit[1] <= 0) return 113;
+	// A parameter vector is as long as its name says: a border colour is four values.
+	GLuint texture = 0;
+	glGenTextures(1, &texture);
+	glBindTexture(GL_TEXTURE_2D, texture);
+	const GLfloat border[] = {.25f, .5f, .75f, 1};
+	GLfloat read[6] = {9, 0, 0, 0, 0, 9};
+	glTexParameterfv_(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, border);
+	glGetTexParameterfv_(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, read + 1);
+	if (glGetError() || read[0] != 9 || read[5] != 9 || read[1] != .25f || read[3] != .75f) return 100;
+	glDeleteTextures(1, &texture);
+	// An error the game raised stays for the game to read, whatever the bridge asked the driver in between.
+	glEnable(0x7fff);
+	glTexParameterfv_(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, border);
+	if (glGetError() != GL_INVALID_ENUM || glGetError()) return 101;
+	// Buffer contents: partial uploads, read-backs and mappings.
+	GLuint buffer = 0;
+	glGenBuffers_(1, &buffer);
+	glBindBuffer_(0x8892, buffer);
+	glBufferData_(0x8892, 16, NULL, 0x88e8);
+	const unsigned char bytes[] = {1, 2, 3, 4};
+	glBufferSubData_(0x8892, 4, 4, bytes);
+	unsigned char *mapped = glMapBufferRange_(0x8892, 8, 8, 0x0002);
+	if (!mapped) return 102;
+	for (unsigned index = 0; index < 8; ++index) mapped[index] = (unsigned char)(10 + index);
+	if (!glUnmapBuffer_(0x8892)) return 103;
+	const unsigned char *whole = glMapBuffer_(0x8892, 0x88b8);
+	if (!whole || whole[4] != 1 || whole[7] != 4 || whole[8] != 10 || whole[15] != 17 || !glUnmapBuffer_(0x8892)) return 104;
+	unsigned char back[18];
+	back[0] = back[17] = 0x7b;
+	glGetBufferSubData_(0x8892, 0, 16, back + 1);
+	if (glGetError() || back[0] != 0x7b || back[17] != 0x7b || back[5] != 1 || back[16] != 17) return 105;
+	glBindBuffer_(0x8892, 0);
+	glDeleteBuffers_(1, &buffer);
+	// Instances read a per-instance array once for each instance: the second quad covers the first in the second colour.
+	const char *vertex_source[] = {"#version 120\nattribute vec4 tint; varying vec4 colour; void main() { gl_Position = gl_Vertex; colour = tint; }"};
+	const char *fragment_source[] = {"#version 120\nuniform vec4 scale; varying vec4 colour; void main() { gl_FragColor = colour * scale; }"};
+	GLuint vertex = glCreateShader_(0x8b31), fragment = glCreateShader_(0x8b30), program = glCreateProgram_();
+	glShaderSource_(vertex, 1, vertex_source, NULL);
+	glShaderSource_(fragment, 1, fragment_source, NULL);
+	glCompileShader_(vertex); glCompileShader_(fragment);
+	glAttachShader_(program, vertex); glAttachShader_(program, fragment);
+	glBindAttribLocation_(program, 3, "tint");
+	glLinkProgram_(program);
+	glUseProgram_(program);
+	const GLint scale = glGetUniformLocation_(program, "scale");
+	const GLfloat ones[] = {1, 1, 1, 1};
+	GLfloat uniform[6] = {9, 0, 0, 0, 0, 9};
+	glUniform4fv_(scale, 1, ones);
+	glGetUniformfv_(program, scale, uniform + 1);
+	if (glGetError() || scale < 0 || uniform[0] != 9 || uniform[5] != 9 || uniform[4] != 1) return 106;
+	char name[16] = "xxxxxxxxxxxxxxx";
+	GLsizei length = 0;
+	GLint size = 0;
+	GLenum type = 0;
+	glGetActiveUniform_(program, 0, sizeof(name), &length, &size, &type, name);
+	if (length != 5 || size != 1 || type != 0x8b52 || lstrcmpA(name, "scale") || glGetAttribLocation_(program, "tint") != 3) return 107;
+	const float positions[] = {-1, -1, 1, -1, 1, 1, -1, 1};
+	const unsigned char tints[] = {255, 0, 0, 255, 0, 0, 255, 255};
+	glClearColor(0, 0, 0, 1);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glEnableClientState(GL_VERTEX_ARRAY);
+	glVertexPointer(2, GL_FLOAT, 0, positions);
+	glEnableVertexAttribArray_(3);
+	glVertexAttribPointer_(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, 0, tints);
+	glVertexAttribDivisor_(3, 1);
+	glDrawArraysInstanced_(GL_QUADS, 0, 4, 2);
+	if (glGetError() || !pixel(16, 16, 0, 0, 255)) return 108;
+	// A ranged draw from the game's own indices, counted by a query.
+	const unsigned char indices[] = {0, 1, 2, 3};
+	glVertexAttribDivisor_(3, 0);
+	const unsigned char greens[] = {0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255};
+	glVertexAttribPointer_(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, 0, greens);
+	GLuint query = 0, samples = 0;
+	glGenQueries_(1, &query);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glBeginQuery_(0x8914, query);
+	glDrawRangeElements_(GL_QUADS, 0, 3, 4, GL_UNSIGNED_BYTE, indices);
+	glEndQuery_(0x8914);
+	glGetQueryObjectuiv_(query, 0x8866, &samples);
+	if (glGetError() || !samples || !pixel(16, 16, 0, 255, 0)) return 109;
+	glDeleteQueries_(1, &query);
+	glDisableVertexAttribArray_(3);
+	glDisableClientState(GL_VERTEX_ARRAY);
+	glUseProgram_(0);
+	glDeleteProgram_(program); glDeleteShader_(vertex); glDeleteShader_(fragment);
+	// A fence the game waits on, then deletes.
+	void *fence = glFenceSync_(0x9117, 0);
+	if (!fence || !glIsSync_(fence)) return 110;
+	const GLenum waited = glClientWaitSync_(fence, 1, 1000000000);
+	if (waited != 0x911a && waited != 0x911c) return 111;
+	glDeleteSync_(fence);
+	if (glIsSync_(fence) || glGetError()) return 112;
 	return 0;
 }
 
@@ -380,9 +593,11 @@ int raven_entry(void)
 		if (!enable) return 62;
 		enable(0);
 	}
+	// Each of these leaves an array enabled at an address the game never filled: the draw fails as for any unreadable pointer.
 	if (option_requested("--array-")) {
+		SetLastError(0);
 		glDrawArrays(GL_QUADS, 0, 4);
-		return 63;
+		return GetLastError() == ERROR_NOACCESS && !glGetError() ? 95 : 63;
 	}
 	glDisableClientState(GL_VERTEX_ARRAY);
 	if (!pixel(16, 16, 0, 255, 0)) return 12;
@@ -398,8 +613,12 @@ int raven_entry(void)
 	if (!pixel(1, 1, 255, 0, 0) || !pixel(30, 30, 0, 255, 0)) return 14;
 	glDeleteLists(list, 1);
 	release(1, &buffer);
+	const int client = client_arrays();
+	if (client) return client;
 	const int features = game_features();
 	if (features) return features;
+	const int profile = compatibility_profile();
+	if (profile) return profile;
 	glClearColor(1, 0, 0, 1);
 	glClear(GL_COLOR_BUFFER_BIT);
 	ShowWindow(window, SW_HIDE);

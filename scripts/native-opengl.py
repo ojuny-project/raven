@@ -22,6 +22,8 @@ def main():
     native = sys.argv[3] == "native"
     gpu = "gpu" in sys.argv[5:]
     maximize = "maximize" in sys.argv[5:]
+    # The client maximizes its window itself (opengl_hidden_start_client.c): only its frame covering the display is checked.
+    covers = maximize or "covers" in sys.argv[5:]
     invalid_array = next((option for option in sys.argv[5:] if option.startswith(("array-", "bad-element-")) or option == "forged-elements"), None)
     options = (["--maximize"] if maximize else []) + (["--" + invalid_array] if invalid_array else [])
     if "queued-elements" in sys.argv[5:]:
@@ -69,7 +71,11 @@ def main():
                 elif invalid_array.startswith("bad-element-"):
                     expected = "OpenGL element " + invalid_array.removeprefix("bad-element-") + " exceeds"
                 else:
-                    expected = r"OpenGL draw uses an uncopied (client array|texture array|vertex attribute)"
+                    # An array left at an address the guest never filled fails the draw the way an unreadable pointer does.
+                    if status != 95:
+                        raise RuntimeError(f"OpenGL draw from an unreadable array did not fail: status {status}, {text[-1000:]}")
+                    print("OpenGL draw from an unreadable array failed before host drawing")
+                    return
                 if status != 1 or not re.search(expected, text):
                     raise RuntimeError(f"unsafe OpenGL draw was not rejected: status {status}, {text[-1000:]}")
                 print("Unsafe OpenGL draw rejected before host drawing")
@@ -89,9 +95,9 @@ def main():
             colors = image.getcolors(image.width * image.height)
             if sum(count for count, pixel in colors if pixel == (255, 0, 0)) < 32 * 32:
                 raise RuntimeError("the compositor did not display the red OpenGL frame")
+            if covers and sum(count for count, pixel in colors if pixel == (255, 0, 0)) < image.width * image.height * 0.75:
+                raise RuntimeError("maximized OpenGL surface does not cover the display")
             if maximize:
-                if sum(count for count, pixel in colors if pixel == (255, 0, 0)) < image.width * image.height * 0.75:
-                    raise RuntimeError("maximized OpenGL surface does not cover the display")
                 for x in (0, 1):
                     for y in (0, 1):
                         quadrant = image.crop((x * image.width // 2, y * image.height // 2,

@@ -16,6 +16,7 @@ namespace raven {
 // pointer_wheel: message carries the signed wheel delta in 1/120 notches (wparam 1 for the horizontal wheel), x and y the pointer position.
 // popup_done: the compositor dismissed a popup (for example by a click outside it).
 // pointer_relative: x and y carry the movement of the mouse itself, unaccelerated and not stopped by the screen edges.
+// resize: x and y carry the size the host gives the window, wparam 1 when the host shows it maximized.
 enum class DesktopEventKind { message, pointer_motion, pointer_button, keymap, modifiers, keyboard_focus, key, popup_done, resize, pointer_wheel,
 	pointer_relative, pointer_leave };
 
@@ -89,12 +90,26 @@ struct DesktopPresentation {
 	// Keeps a top-level window above the top-level window that owns it, as Windows keeps an owned dialog; 0 for no owner. Given before the
 	// window's first frame.
 	std::function<void(uint64_t handle,uint64_t owner)> transient_for;
+	// Shows a top-level window inside a window of another program, the host window system's id of that window (an X11 window), as an
+	// editor shows in its host's; 0 shows it on its own again. Given before the window's first frame. Absent where the window system
+	// cannot show a window inside another program's.
+	std::function<void(uint64_t handle,uint64_t host)> embed;
 	// Whether the window's pixels carry premultiplied alpha, as those a layered window hands over do: the compositor blends them over
 	// what lies below instead of showing them opaque. Given before the frame.
 	std::function<void(uint64_t handle,bool alpha)> translucent;
 	// Said before a frame is presented: it differs from the window's last one inside this rectangle alone (left, top, right, bottom),
 	// so the rest of it need not be looked at.
 	std::function<void(uint64_t handle,std::array<int32_t,4> area)> changed_within;
+	// Said before a frame of a maximized window is presented: the part of it in the work area (left, top, right, bottom), which the host
+	// shows as the window. A program can place the sizing border of its maximized window past the work area's edges, as Windows does.
+	std::function<void(uint64_t handle,std::array<int32_t,4> area)> shown_within;
+	// Whether a poll that waits for nothing would find nothing to take in or do: no event kept for the program, none read or readable
+	// from the connection, nothing left to send. Peeks beside the turn ask it under the shared desktop lock, several at once; absent,
+	// every peek polls itself.
+	std::function<bool()> quiet;
+	// Requests or leaves full screen for a top-level window, as Windows shows one whose rectangle covers the screen unless it is
+	// maximized with its caption. Said before the window's frame.
+	std::function<void(uint64_t,bool)> full_screen;
 };
 
 }

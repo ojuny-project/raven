@@ -79,15 +79,18 @@ struct WaylandPresentation::State {
 	};
 	struct Buffer {
 		wl_buffer *proxy=nullptr;
+		// The pool stays with the buffer, with room for a larger frame: a window that changes size cuts its next buffers from pages
+		// both processes already hold.
+		wl_shm_pool *pool=nullptr;
 		void *pixels=MAP_FAILED;
-		size_t size=0;
+		size_t size=0,capacity=0;
 		uint32_t width=0,height=0;
 		// What changed since this buffer last received a frame (left, top, right, bottom): only that part is copied into it again.
 		std::array<int32_t,4> stale{0,0,0,0};
 		bool released=false;
 		// Whether its pixels carry premultiplied alpha (ARGB) or are opaque (XRGB).
 		bool alpha=false;
-		~Buffer() { if (proxy) wl_buffer_destroy(proxy); if (pixels!=MAP_FAILED) munmap(pixels,size); }
+		~Buffer() { if (proxy) wl_buffer_destroy(proxy); if (pool) wl_shm_pool_destroy(pool); if (pixels!=MAP_FAILED) munmap(pixels,capacity); }
 	};
 	struct Surface {
 		wl_surface *proxy=nullptr;
@@ -108,7 +111,11 @@ struct WaylandPresentation::State {
 		// Whether the compositor's last configure shows the window maximized, whether the state Raven asked for is still to come, and
 		// whether the program was told of a state the compositor chose itself.
 		bool shown_maximized=false, state_asked=true, state_reported=false;
+		// Whether the window covers the screen and the compositor was asked to show it full screen.
+		bool full_screen=false;
+		// The size of the window geometry, and where it starts in the frame.
 		uint32_t width=0,height=0,pending_width=0,pending_height=0;
+		int32_t geometry_x=0,geometry_y=0;
 		std::vector<std::unique_ptr<Buffer>> buffers;
 		// The buffer of the last commit, whose pixels are what the compositor shows, and the hash of each of its rows.
 		Buffer *shown=nullptr;
@@ -142,6 +149,10 @@ struct WaylandPresentation::State {
 	zwp_confined_pointer_v1 *confined=nullptr;
 	zwp_locked_pointer_v1 *locked=nullptr;
 	int64_t relative_x=0,relative_y=0;
+	// The accelerated relative motion of the pointer frame being received, and whether the frame also moved the pointer to a place: a
+	// compositor may report a mouse by relative motion alone for a while (labwc over a full screen game), and the cursor follows it.
+	int64_t frame_x=0,frame_y=0;
+	bool moved_relatively=false,moved_to_place=false;
 	uint64_t constrained_window=0;
 #ifdef RAVEN_WAYLAND_VIEWPORTER
 	wp_viewporter *viewporter=nullptr;
@@ -204,6 +215,8 @@ struct WaylandPresentation::State {
 	std::map<uint64_t,std::unique_ptr<Hosted>> hosted;
 	// The rectangle the next frame of a window differs from its last in, when its presenter said so.
 	std::map<uint64_t,std::array<int32_t,4>> within;
+	// The part of the next frame of a maximized window that lies in the work area.
+	std::map<uint64_t,std::array<int32_t,4>> on_screen;
 	uint64_t hosted_order=0;
 	// Child windows drawn by GDI shown over the driver's surfaces of their root (see overlay).
 	struct Overlay {
@@ -216,8 +229,13 @@ struct WaylandPresentation::State {
 	};
 	std::map<uint64_t,std::unique_ptr<Overlay>> overlays;
 	std::set<uint64_t> maximized;
+	// Windows that cover the screen, which the compositor shows full screen on the output instead of placing them.
+	std::set<uint64_t> full_screens;
 	// The top-level window that owns each window, which the compositor keeps it above.
 	std::map<uint64_t,uint64_t> owners;
+	// The windows of other programs that top-level windows show inside, by handle (see embed): such a window's toplevel names the other
+	// window in its application id, for the compositor of that program to show it there (the bridge of a VST 3 plugin, native/vst).
+	std::map<uint64_t,uint64_t> embedders;
 	// Windows whose pixels carry premultiplied alpha, which the compositor blends over what lies below.
 	std::set<uint64_t> translucent;
 
@@ -284,9 +302,10 @@ struct WaylandPresentation::State {
 		if (relative || !relative_manager || !pointer) return;
 		relative=zwp_relative_pointer_manager_v1_get_relative_pointer(relative_manager,pointer);
 		static const zwp_relative_pointer_v1_listener listener{
-			[](void *data,zwp_relative_pointer_v1 *,uint32_t,uint32_t,wl_fixed_t,wl_fixed_t,wl_fixed_t dx,wl_fixed_t dy) {
+			[](void *data,zwp_relative_pointer_v1 *,uint32_t,uint32_t,wl_fixed_t accelerated_x,wl_fixed_t accelerated_y,wl_fixed_t dx,wl_fixed_t dy) {
 				// The unaccelerated movement in whole units; the fractions add up across reports.
 				auto &state=*static_cast<State *>(data);
+				state.frame_x+=accelerated_x; state.frame_y+=accelerated_y; state.moved_relatively=true;
 				state.relative_x+=dx; state.relative_y+=dy;
 				const auto x=int32_t(state.relative_x/256),y=int32_t(state.relative_y/256);
 				state.relative_x-=int64_t(x)*256; state.relative_y-=int64_t(y)*256;
@@ -311,6 +330,26 @@ struct WaylandPresentation::State {
 		else if (shape_device) wp_cursor_shape_device_v1_set_shape(shape_device,enter_serial,cursor_shape(cursor));
 #endif
 		if (display) wl_display_flush(display);
+	}
+
+	// The end of a pointer frame. When it moved the pointer only relatively, the cursor moves by that much within the window it is on;
+	// a held (locked) pointer stays put, as a cursor clipped to a point does.
+	void pointer_frame() {
+		if (moved_relatively && !moved_to_place && pointer_window && !locked) {
+			const auto x=int32_t(frame_x/256),y=int32_t(frame_y/256);
+			frame_x-=int64_t(x)*256; frame_y-=int64_t(y)*256;
+			const auto found=surfaces.find(pointer_window);
+			const auto limit=[](int64_t value,uint32_t size) {
+				return int32_t(size ? std::clamp<int64_t>(value,0,int64_t(size)-1) : value);
+			};
+			const auto width=found!=surfaces.end() ? found->second->width : 0,height=found!=surfaces.end() ? found->second->height : 0;
+			const auto next_x=limit(int64_t(pointer_x)+x,width),next_y=limit(int64_t(pointer_y)+y,height);
+			if (next_x!=pointer_x || next_y!=pointer_y) {
+				pointer_x=next_x; pointer_y=next_y;
+				pointer_event(DesktopEventKind::pointer_motion);
+			}
+		} else if (moved_to_place) frame_x=frame_y=0;
+		moved_relatively=moved_to_place=false;
 	}
 
 	void pointer_event(DesktopEventKind kind,uint32_t button=0,uint32_t pressed=0) {
@@ -356,7 +395,7 @@ struct WaylandPresentation::State {
 				value.enter=[](void *data,wl_pointer *,uint32_t serial,wl_surface *surface,wl_fixed_t x,wl_fixed_t y) {
 					auto &state=*static_cast<State *>(data); state.pointer_window=0; state.last_serial=serial;
 					for (const auto &[handle,window] : state.surfaces) if (window->proxy==surface) state.pointer_window=handle;
-					state.enter_serial=serial; state.pointer_inside=true; state.show_cursor();
+					state.enter_serial=serial; state.pointer_inside=true; state.moved_to_place=true; state.show_cursor();
 					state.pointer_x=coordinate(x); state.pointer_y=coordinate(y); state.pointer_event(DesktopEventKind::pointer_motion);
 				};
 				value.leave=[](void *data,wl_pointer *,uint32_t,wl_surface *) {
@@ -365,7 +404,7 @@ struct WaylandPresentation::State {
 				};
 				value.motion=[](void *data,wl_pointer *,uint32_t,wl_fixed_t x,wl_fixed_t y) {
 					auto &state=*static_cast<State *>(data); state.pointer_x=coordinate(x); state.pointer_y=coordinate(y);
-					state.pointer_event(DesktopEventKind::pointer_motion);
+					state.moved_to_place=true; state.pointer_event(DesktopEventKind::pointer_motion);
 				};
 				value.button=[](void *data,wl_pointer *,uint32_t serial,uint32_t,uint32_t button,uint32_t pressed) {
 					auto &state=*static_cast<State *>(data);
@@ -395,6 +434,11 @@ struct WaylandPresentation::State {
 					remainder-=delta;
 					if (delta) state.pointer_event(DesktopEventKind::pointer_wheel,uint32_t(delta),horizontal ? 1 : 0);
 				};
+				// Version 5 groups the pointer's events in frames; the source and end of scrolling and its steps add nothing here.
+				value.frame=[](void *data,wl_pointer *) { static_cast<State *>(data)->pointer_frame(); };
+				value.axis_source=[](void *,wl_pointer *,uint32_t) {};
+				value.axis_stop=[](void *,wl_pointer *,uint32_t,uint32_t) {};
+				value.axis_discrete=[](void *,wl_pointer *,uint32_t,int32_t) {};
 				return value;
 			}();
 			wl_pointer_add_listener(state.pointer,&listener,&state);
@@ -451,6 +495,8 @@ struct WaylandPresentation::State {
 					if (std::getenv("RAVEN_TRACE_KEYS")) fprintf(stderr,"modifiers %x %x %x group %u\n",depressed,latched,locked,group);
 					static_cast<State *>(data)->keyboard_event({0,depressed,latched,uint64_t(locked)|(uint64_t(group)<<32),DesktopEventKind::modifiers});
 				};
+				// Key repeat is the program's own business, as on Windows.
+				value.repeat_info=[](void *,wl_keyboard *,int32_t,int32_t) {};
 				return value;
 			}();
 			wl_keyboard_add_listener(state.keyboard,&listener,&state);
@@ -611,8 +657,9 @@ struct WaylandPresentation::State {
 		}
 		else if (!std::strcmp(interface,"wl_seat")) {
 			if (state.seat) { state.input_failed=true; return; }
-			state.seat=static_cast<wl_seat *>(wl_registry_bind(registry,name,&wl_seat_interface,1));
-			static const wl_seat_listener listener{capabilities,nullptr};
+			// Version 5 for the pointer's frames.
+			state.seat=static_cast<wl_seat *>(wl_registry_bind(registry,name,&wl_seat_interface,std::min(version,5U)));
+			static const wl_seat_listener listener{capabilities,[](void *,wl_seat *,const char *) {}};
 			wl_seat_add_listener(state.seat,&listener,&state);
 			state.make_data_device();
 		}
@@ -656,6 +703,25 @@ struct WaylandPresentation::State {
 		if ((ready<0 && polling_error!=EINTR) || (socket.revents & (POLLERR|POLLHUP|POLLNVAL)) || wl_display_dispatch_pending(display)<0)
 			throw std::runtime_error("Wayland connection failed");
 		if (input_failed) throw std::runtime_error(input_error);
+	}
+
+	// See DesktopPresentation::quiet. A graphics driver presenting to the program's windows reads the same connection, so events can sit
+	// in the queue with the socket empty. Only polling changes what is kept here, under the whole desktop lock.
+	bool quiet() {
+		if (!display) return true;
+		if (!pending.empty() || input_failed) return false;
+		for (const auto &[handle,surface] : surfaces) {
+			if (surface->is_popup) { if (surface->closed && !surface->close_posted) return false; continue; }
+			const bool settled=surface->shown_maximized==surface->maximized;
+			if ((!settled && !surface->state_asked && !surface->state_reported) ||
+				(surface->resized && (settled || !surface->state_reported)) || (surface->closed && !surface->close_posted)) return false;
+		}
+		if (wl_display_prepare_read(display)!=0) return false;
+		const bool flushed=wl_display_flush(display)>=0;
+		pollfd socket{wl_display_get_fd(display),POLLIN,0};
+		const bool readable=::poll(&socket,1,0)!=0;
+		wl_display_cancel_read(display);
+		return flushed && !readable;
 	}
 
 	void sync() {
@@ -738,7 +804,8 @@ struct WaylandPresentation::State {
 
 	void attach_frame(Surface &window,uint32_t width,uint32_t height,std::span<const uint8_t> pixels,const std::array<int32_t,4> *within=nullptr) {
 		events(std::chrono::milliseconds(0));
-		// Released buffers of this size are reused; the compositor only repaints what changed since the shown frame.
+		// Released buffers are reused, cut again from their pool for another size; the compositor only repaints what changed since the
+		// shown frame.
 		std::array<int32_t,4> damage{0,0,int32_t(width),int32_t(height)};
 		const bool same_size=window.shown && window.shown->width==width && window.shown->height==height && window.shown->alpha==window.alpha;
 		// Hashes describe the shown frame only after a comparison made them; a frame presented whole leaves none.
@@ -750,9 +817,28 @@ struct WaylandPresentation::State {
 				return;
 			}
 		}
-		std::erase_if(window.buffers,[&](const auto &buffer) {
-			return buffer->released && buffer.get()!=window.shown && (buffer->width!=width || buffer->height!=height || buffer->alpha!=window.alpha);
-		});
+		static const wl_buffer_listener buffer_listener{[](void *data,wl_buffer *) { static_cast<Buffer *>(data)->released=true; }};
+		const auto format=window.alpha ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
+		const auto other=[&](const Buffer &buffer) {
+			return buffer.released && &buffer!=window.shown && (buffer.width!=width || buffer.height!=height || buffer.alpha!=window.alpha);
+		};
+		constexpr size_t memory_limit=256*1024*1024;
+		size_t used=0;
+		for (const auto &[key,surface] : surfaces)
+			for (const auto &buffer : surface->buffers) used+=buffer->size;
+		for (auto &buffer : window.buffers)
+			if (other(*buffer) && buffer->capacity>=pixels.size() && used-buffer->size+pixels.size()<=memory_limit) {
+				// The pages past the new frame go back to the system: a buffer holds only what its frame uses.
+				const size_t kept=(pixels.size()+4095)&~size_t(4095);
+				madvise(static_cast<uint8_t *>(buffer->pixels)+kept,buffer->capacity-kept,MADV_REMOVE);
+				used=used-buffer->size+pixels.size();
+				wl_buffer_destroy(buffer->proxy);
+				buffer->proxy=wl_shm_pool_create_buffer(buffer->pool,0,int32_t(width),int32_t(height),int32_t(width*4),format);
+				wl_buffer_add_listener(buffer->proxy,&buffer_listener,buffer.get());
+				buffer->size=pixels.size(); buffer->width=width; buffer->height=height; buffer->alpha=window.alpha;
+				buffer->stale={0,0,int32_t(width),int32_t(height)};
+			}
+		std::erase_if(window.buffers,[&](const auto &buffer) { return other(*buffer); });
 		Buffer *target=nullptr;
 		size_t pending=0;
 		for (const auto &buffer : window.buffers) {
@@ -761,22 +847,21 @@ struct WaylandPresentation::State {
 		}
 		if (!target) {
 			if (pending>=3) throw std::runtime_error("Wayland presentation buffer limit reached");
-			size_t used=0;
+			used=0;
 			for (const auto &[key,surface] : surfaces)
 				for (const auto &buffer : surface->buffers) used+=buffer->size;
-			if (used+pixels.size()>256*1024*1024) throw std::runtime_error("Wayland presentation memory limit reached");
+			if (used+pixels.size()>memory_limit) throw std::runtime_error("Wayland presentation memory limit reached");
 			auto buffer=std::make_unique<Buffer>(); buffer->size=pixels.size(); buffer->width=width; buffer->height=height;
 			buffer->stale={0,0,int32_t(width),int32_t(height)}; buffer->alpha=window.alpha;
+			// Twice the frame: the file is sparse, so the room costs nothing until a larger frame fills it.
+			buffer->capacity=(buffer->size*2+4095)&~size_t(4095);
 			const int descriptor=int(syscall(SYS_memfd_create,"raven-frame",MFD_CLOEXEC));
 			if (descriptor<0) throw std::runtime_error("Wayland frame descriptor failed");
-			if (ftruncate(descriptor,off_t(buffer->size))<0) { close(descriptor); throw std::runtime_error("Wayland frame sizing failed"); }
-			buffer->pixels=mmap(nullptr,buffer->size,PROT_READ|PROT_WRITE,MAP_SHARED,descriptor,0);
+			if (ftruncate(descriptor,off_t(buffer->capacity))<0) { close(descriptor); throw std::runtime_error("Wayland frame sizing failed"); }
+			buffer->pixels=mmap(nullptr,buffer->capacity,PROT_READ|PROT_WRITE,MAP_SHARED,descriptor,0);
 			if (buffer->pixels==MAP_FAILED) { close(descriptor); throw std::runtime_error("Wayland frame mapping failed"); }
-			wl_shm_pool *pool=wl_shm_create_pool(shm,descriptor,int32_t(buffer->size)); close(descriptor);
-			buffer->proxy=wl_shm_pool_create_buffer(pool,0,int32_t(width),int32_t(height),int32_t(width*4),
-				window.alpha ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888);
-			wl_shm_pool_destroy(pool);
-			static const wl_buffer_listener buffer_listener{[](void *data,wl_buffer *) { static_cast<Buffer *>(data)->released=true; }};
+			buffer->pool=wl_shm_create_pool(shm,descriptor,int32_t(buffer->capacity)); close(descriptor);
+			buffer->proxy=wl_shm_pool_create_buffer(buffer->pool,0,int32_t(width),int32_t(height),int32_t(width*4),format);
 			wl_buffer_add_listener(buffer->proxy,&buffer_listener,buffer.get());
 			target=buffer.get();
 			window.buffers.push_back(std::move(buffer));
@@ -852,7 +937,7 @@ struct WaylandPresentation::State {
 			window->shell=xdg_wm_base_get_xdg_surface(shell,window->proxy);
 			xdg_positioner *positioner=xdg_wm_base_create_positioner(shell);
 			xdg_positioner_set_size(positioner,int32_t(width),int32_t(height));
-			xdg_positioner_set_anchor_rect(positioner,x,y,1,1);
+			xdg_positioner_set_anchor_rect(positioner,x-owner->second->geometry_x,y-owner->second->geometry_y,1,1);
 			xdg_positioner_set_anchor(positioner,XDG_POSITIONER_ANCHOR_TOP_LEFT);
 			xdg_positioner_set_gravity(positioner,XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
 			// A menu that would leave the screen opens on the other side of the point, as Windows opens one near the bottom upwards; with
@@ -947,6 +1032,12 @@ struct WaylandPresentation::State {
 			wl_region *none=wl_compositor_create_region(compositor);
 			wl_surface_set_input_region(entry->proxy,none);
 			wl_region_destroy(none);
+			// Windows shows what a driver draws for a window opaque, whatever alpha its pixels hold: a game that never writes alpha
+			// leaves it at zero. The compositor cuts the region to the surface's size.
+			wl_region *whole=wl_compositor_create_region(compositor);
+			wl_region_add(whole,0,0,INT32_MAX,INT32_MAX);
+			wl_surface_set_opaque_region(entry->proxy,whole);
+			wl_region_destroy(whole);
 		}
 		// A host window made again for the root leaves the old role inert.
 		const bool moved=entry->role && (!parent || entry->parent!=parent->serial);
@@ -1028,7 +1119,7 @@ struct WaylandPresentation::State {
 		for (const auto &buffer : entry->buffers) if (buffer->released && !target) target=buffer.get();
 		if (!target) {
 			if (entry->buffers.size()>=3) return;
-			auto buffer=std::make_unique<Buffer>(); buffer->size=size_t(width)*height*4; buffer->width=width; buffer->height=height;
+			auto buffer=std::make_unique<Buffer>(); buffer->size=buffer->capacity=size_t(width)*height*4; buffer->width=width; buffer->height=height;
 			const int descriptor=int(syscall(SYS_memfd_create,"raven-overlay",MFD_CLOEXEC));
 			if (descriptor<0) return;
 			if (ftruncate(descriptor,off_t(buffer->size))<0) { close(descriptor); return; }
@@ -1063,6 +1154,19 @@ struct WaylandPresentation::State {
 		xdg_toplevel_set_parent(found->second->role,shown ? parent->second->role : nullptr);
 	}
 
+	// Shows a top-level window inside a window of another program from its next frame on, or on its own again for 0.
+	void embed(uint64_t handle,uint64_t host) {
+		const auto known=embedders.find(handle);
+		if (known==embedders.end() ? !host : known->second==host) return;
+		if (host) embedders[handle]=host;
+		else embedders.erase(known);
+		// A window shown already is made again, with its new application id, by its next frame.
+		if (const auto found=surfaces.find(handle); found!=surfaces.end() && found->second->role) {
+			surfaces.erase(found);
+			sync();
+		}
+	}
+
 	void transient_for(uint64_t handle,uint64_t owner) {
 		const auto known=owners.find(handle);
 		if (owner ? known!=owners.end() && known->second==owner : known==owners.end()) return;
@@ -1088,11 +1192,27 @@ struct WaylandPresentation::State {
 		if (!window.configured || window.closed) throw std::runtime_error("Wayland maximization configuration failed");
 	}
 
+	void full_screen(uint64_t handle,bool wanted) {
+		if (wanted) full_screens.insert(handle); else full_screens.erase(handle);
+		const auto found=surfaces.find(handle);
+		if (found==surfaces.end() || !found->second->role || found->second->full_screen==wanted) return;
+		auto &window=*found->second;
+		window.full_screen=wanted;
+		if (wanted) xdg_toplevel_set_fullscreen(window.role,nullptr);
+		else xdg_toplevel_unset_fullscreen(window.role);
+	}
+
 	void present(uint64_t handle,std::string_view title,uint32_t width,uint32_t height,std::span<const uint8_t> pixels) {
+		const auto shown=on_screen.extract(handle);
 		if (!handle || !width || !height || width>8192 || height>8192 || uint64_t(width)*height>16*1024*1024 || pixels.size()!=size_t(width)*height*4)
 			throw std::runtime_error("invalid native Wayland frame");
 		connect();
 		const auto area=within.extract(handle);
+		auto part=std::array<int32_t,4>{0,0,int32_t(width),int32_t(height)};
+		if (shown && 0<=shown.mapped()[0] && shown.mapped()[0]<shown.mapped()[2] && shown.mapped()[2]<=part[2] && 0<=shown.mapped()[1] &&
+			shown.mapped()[1]<shown.mapped()[3] && shown.mapped()[3]<=part[3])
+			part=shown.mapped();
+		const auto shown_width=uint32_t(part[2]-part[0]),shown_height=uint32_t(part[3]-part[1]);
 		auto found=surfaces.find(handle);
 		// A window shown as a popup until now becomes a window of its own.
 		if (found!=surfaces.end() && found->second->is_popup) {
@@ -1101,8 +1221,9 @@ struct WaylandPresentation::State {
 		}
 		if (found==surfaces.end()) {
 			auto window=std::make_unique<Surface>();
-			window->width=width; window->height=height;
+			window->width=shown_width; window->height=shown_height;
 			window->maximized=maximized.contains(handle);
+			window->full_screen=full_screens.contains(handle);
 			window->proxy=wl_compositor_create_surface(compositor);
 			window->shell=xdg_wm_base_get_xdg_surface(shell,window->proxy);
 			window->role=xdg_surface_get_toplevel(window->shell);
@@ -1122,9 +1243,11 @@ struct WaylandPresentation::State {
 			xdg_surface_add_listener(window->shell,&surface_listener,window.get());
 			xdg_toplevel_add_listener(window->role,&role_listener,window.get());
 			xdg_toplevel_set_title(window->role,std::string(title).c_str());
-			xdg_toplevel_set_app_id(window->role,"raven.native");
+			const auto embedder=embedders.find(handle);
+			xdg_toplevel_set_app_id(window->role,embedder==embedders.end() ? "raven.native" : ("raven-embed-"+std::to_string(embedder->second)).c_str());
 			// A floating window starts at its requested size; a maximized one follows the compositor's work area.
 			if (window->maximized) xdg_toplevel_set_maximized(window->role);
+			else if (window->full_screen) xdg_toplevel_set_fullscreen(window->role,nullptr);
 			else {
 				xdg_toplevel_set_min_size(window->role,int32_t(width),int32_t(height));
 				xdg_toplevel_set_max_size(window->role,int32_t(width),int32_t(height));
@@ -1149,10 +1272,13 @@ struct WaylandPresentation::State {
 		}
 		if (window.closed) throw std::runtime_error("Wayland surface cannot accept this frame");
 		if (window.maximized && window.pending_width && window.pending_height &&
-			(window.pending_width!=width || window.pending_height!=height)) return;
-		if (window.pending_width==width && window.pending_height==height) window.resized=false;
-		window.width=width; window.height=height;
-		xdg_surface_set_window_geometry(window.shell,0,0,int32_t(width),int32_t(height));
+			(window.pending_width!=shown_width || window.pending_height!=shown_height)) return;
+		if (window.pending_width==shown_width && window.pending_height==shown_height) window.resized=false;
+		window.width=shown_width; window.height=shown_height;
+		window.geometry_x=part[0]; window.geometry_y=part[1];
+		// shortcut: the frame outside the geometry still shows, and takes input, where nothing else covers it: on an output beside this one,
+		// or in a strip the compositor keeps free for a panel. Crop it with a viewport when that shows.
+		xdg_surface_set_window_geometry(window.shell,part[0],part[1],int32_t(shown_width),int32_t(shown_height));
 		window.alpha=translucent.contains(handle);
 		attach_frame(window,width,height,pixels,area ? &area.mapped() : nullptr);
 		if (window.first_frame) {
@@ -1181,7 +1307,10 @@ DesktopPresentation WaylandPresentation::callbacks()
 		state->present(handle,title,width,height,pixels);
 	},[this](uint64_t handle) {
 		state->maximized.erase(handle);
+		state->full_screens.erase(handle);
+		state->on_screen.erase(handle);
 		state->owners.erase(handle);
+		state->embedders.erase(handle);
 		state->translucent.erase(handle);
 		if (state->pointer_window==handle) state->pointer_window=0;
 		if (state->keyboard_window==handle) state->keyboard_window=0;
@@ -1207,7 +1336,8 @@ DesktopPresentation WaylandPresentation::callbacks()
 			// The size that comes with such a state waits until the program has followed it, so the window it remembers to restore
 			// is the one it had, not the compositor's maximized size.
 			if (surface->resized && !surface->is_popup && !surface->state_reported) {
-				events.push_back({handle,0,0,0,DesktopEventKind::resize,int32_t(surface->pending_width),int32_t(surface->pending_height)});
+				events.push_back({handle,0,surface->shown_maximized,0,DesktopEventKind::resize,int32_t(surface->pending_width),
+					int32_t(surface->pending_height)});
 				surface->resized=false;
 			}
 			if (surface->closed && !surface->close_posted) {
@@ -1252,7 +1382,11 @@ DesktopPresentation WaylandPresentation::callbacks()
 		state->overlay(handle,window,x,y,width,height,pixels,stride);
 	}};
 	result.transient_for=[this](uint64_t handle,uint64_t owner) { state->transient_for(handle,owner); };
+	result.embed=[this](uint64_t handle,uint64_t host) { state->embed(handle,host); };
+	result.full_screen=[this](uint64_t handle,bool wanted) { state->full_screen(handle,wanted); };
+	result.quiet=[this] { return state->quiet(); };
 	result.changed_within=[this](uint64_t handle,std::array<int32_t,4> area) { state->within[handle]=area; };
+	result.shown_within=[this](uint64_t handle,std::array<int32_t,4> area) { state->on_screen[handle]=area; };
 	result.translucent=[this](uint64_t handle,bool alpha) {
 		if (alpha) state->translucent.insert(handle);
 		else state->translucent.erase(handle);

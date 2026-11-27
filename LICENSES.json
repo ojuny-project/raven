@@ -102,6 +102,7 @@
         "native/guest/raven-d3dcompiler/ravenhost32.def",
         "native/guest/raven-d3dcompiler/ravenhost64.def",
         "native/guest/raven-deployment/deployment.c",
+        "native/guest/raven-deployment/install.c",
         "native/guest/raven-dism/dism.c",
         "native/guest/raven-dism/dism.manifest",
         "native/guest/raven-dism/dism.rc",
@@ -385,9 +386,12 @@
         "native/guest/raven-taskschd/taskschd_tables.h",
         "native/guest/raven-twinapi/twinapi.c",
         "native/guest/raven-uisettings/uisettings.c",
+        "native/guest/raven-bcp47langs/bcp47langs.c",
         "native/guest/raven-composition/composition.c",
         "native/guest/raven-composition/composition_interfaces.h",
         "native/guest/raven-composition/composition_tables.h",
+        "native/guest/raven-composition/dcomp32.def",
+        "native/guest/raven-composition/dcomp64.def",
         "native/guest/raven-coremessaging/coremessaging.c",
         "native/guest/raven-vbscript/README.md",
         "native/guest/raven-vbscript/builtins.c",
@@ -439,6 +443,7 @@
         "native/guest/raven-windowscodecs/transform.c",
         "native/guest/raven-windowscodecs/wic.h",
         "native/guest/raven-windowscodecs/wuffs.c",
+        "native/guest/raven-windowscodecs/zlib.c",
         "native/guest/raven-winmm/main.c",
         "native/guest/raven-winmm/mixer.c",
         "native/guest/raven-winmm/ravenhost32.def",
@@ -519,6 +524,7 @@
         "native/guest/raven-user32/draw.c",
         "native/guest/raven-user32/edit.c",
         "native/guest/raven-user32/exports.txt",
+        "native/guest/raven-user32/format.c",
         "native/guest/raven-user32/listbox.c",
         "native/guest/raven-user32/make_resources.py",
         "native/guest/raven-user32/mdi.c",
@@ -556,7 +562,12 @@
         "native/guest/raven-installer/README.md",
         "native/guest/raven-installer/dllmain.c",
         "native/guest/raven-installer/msftedit.c",
-        "native/guest/raven-installer/support.c"
+        "native/guest/raven-installer/support.c",
+        "native/guest/raven-vsthost/bridge.h",
+        "native/guest/raven-vsthost/bridge_objects.h",
+        "native/guest/raven-vsthost/host.cpp",
+        "native/guest/raven-vsthost/interfaces.cpp",
+        "native/guest/raven-vsthost/ravenhost64.def"
       ],
       "license": "MIT",
       "review": "reviewed",
@@ -688,6 +699,17 @@
       "revision": "58217a690d6256ee229044a174de67d72d28bc35",
       "provenance": "Interface identifiers, method order, parameters, structures and error codes from Microsoft's Windows metadata as distributed by https://github.com/microsoft/windows-rs (MIT OR Apache-2.0, used under MIT; Copyright (c) Microsoft Corporation), written by scripts/generate-appx-header.py",
       "boundary": "C declarations compiled into the PE guest component raven-appx.dll and its test. No code."
+    },
+    {
+      "name": "VST 3 interface headers",
+      "cmake_keys": [
+        "RAVEN_VST3_SDK_DIRECTORY"
+      ],
+      "license": "MIT",
+      "review": "reviewed",
+      "revision": "3.8.1_build_84",
+      "provenance": "Steinberg's pluginterfaces tree from https://github.com/steinbergmedia/vst3_pluginterfaces (MIT; Copyright (c) 2026, Steinberg Media Technologies GmbH), pinned by tag and checksum in scripts/provision-vst3.py, which keeps the tree's LICENSE.txt beside it",
+      "boundary": "Interface declarations and the identifier and reference counting helpers of funknown.cpp and coreiids.cpp, compiled into the PE guest program raven-vsthost.exe, the Linux plugin raven-vst.so that runs it, and the programs of their tests."
     },
     {
       "name": "External build inputs",
