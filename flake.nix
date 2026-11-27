@@ -37,8 +37,9 @@
                 raven "$@" || status=$?
               fi
               exec 3>&-
-              guest="$(cat "$log" 2>/dev/null || true)"
-              printf 'raven: host exit %s, guest exit %s\n' "$status" "''${guest:-unknown}" >&2
+              guest="$(od -An -tu4 -N4 "$log" 2>/dev/null | tr -d ' \n' || true)"
+              guest_signed="$(od -An -td4 -N4 "$log" 2>/dev/null | tr -d ' \n' || true)"
+              printf 'raven: host exit %s, guest exit %s (signed %s)\n' "$status" "''${guest:-unknown}" "''${guest_signed:-unknown}" >&2
               exit "$status"
             '';
           };
