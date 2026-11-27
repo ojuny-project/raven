@@ -18,7 +18,7 @@ let
     pkgsCross = pkgs.pkgsCross;
   };
 
-  version = "0-unstable-2026-11-19";
+  version = "0-unstable-2026-11-27";
 
   mingw64 = pkgs.pkgsCross."mingw-msvcrt-x86_64".stdenv.cc;
   mingw32 = pkgs.pkgsCross."mingw-msvcrt-i686".stdenv.cc;
@@ -89,6 +89,7 @@ let
     "icu.dll"
     "icuuc.dll"
     "icuin.dll"
+    "bcp47langs.dll"
   ];
 
   runtimePrograms = [
@@ -120,9 +121,9 @@ let
     "rundll32.exe"
   ];
 
-  testFilter = "^(pe_contracts|module_set_contracts|native_(process_return_status|cpu_contracts|memory_contracts|parallel_memory_contracts|parallel_stop_contract|x86_contracts|shared_mapping_contract|provider_contract|launch_arguments_contract|ansi_code_page|hlsl_compiler|update_regions|keyboard_layouts|font_ownership|compatible_bitmap_contract|bitblt_contract|class_info_ownership|window_data_ownership|brush_ownership|exception_contract|object_contract|handle_channel_contract|firmware_memory|string_resource_contract|resource_contract|process_parameters|menu_ownership|extract_icons_contract|png_codec_contract|icon_dib_contract|icon_group_contract|blackonwhite_contract|cpu_contracts_threaded|memory_contracts_threaded|cpu_contracts_agent|memory_contracts_agent|cpu_contracts_agent_threaded|memory_contracts_agent_threaded|cpu_contracts_held|memory_contracts_held|cpu_contracts_held_threaded|memory_contracts_held_threaded|x86_contracts_threaded|x86_contracts_held|x86_contracts_held_threaded|x86_contracts_agent|provider_contract_threaded|provider_contract_held|agent_contract|agent_process))$";
+  testFilter = "^(pe_contracts|module_set_contracts|native_(process_return_status|cpu_contracts|memory_contracts|parallel_memory_contracts|parallel_stop_contract|x86_contracts|shared_mapping_contract|provider_contract|launch_arguments_contract|ansi_code_page|hlsl_compiler|update_regions|keyboard_layouts|font_ownership|compatible_bitmap_contract|bitblt_contract|class_info_ownership|window_data_ownership|brush_ownership|exception_contract|object_contract|handle_channel_contract|firmware_memory|string_resource_contract|resource_contract|process_parameters|menu_ownership|extract_icons_contract|png_codec_contract|icon_dib_contract|icon_group_contract|blackonwhite_contract|cpu_contracts_threaded|memory_contracts_threaded|cpu_contracts_ptrace|memory_contracts_ptrace|cpu_contracts_ptrace_threaded|memory_contracts_ptrace_threaded|x86_contracts_threaded|x86_contracts_ptrace|x86_contracts_ptrace_threaded|provider_contract_threaded|provider_contract_ptrace|agent_contract|agent_tasks|agent_process|host_thread_states))$";
 
-  raven-unwrapped = pkgs.stdenv.mkDerivation {
+  raven-unwrapped-for = { withVst3 ? false }: pkgs.stdenv.mkDerivation {
     pname = "raven-unwrapped";
     inherit version src;
 
@@ -220,6 +221,9 @@ let
       "-DRAVEN_SKIA_SOURCE=${components.skia}/source"
       "-DRAVEN_SKIA_LIBRARY=${components.skia}/lib/libskia.a"
       "-DRAVEN_FONT_DIRECTORY=${components.fonts}"
+    ]
+    ++ lib.optionals withVst3 [
+      "-DRAVEN_VST3_SDK_DIRECTORY=${components.vst3}"
     ];
 
     doCheck = withTests;
@@ -245,6 +249,10 @@ let
       install -Dm755 "$runtime/raven" $out/libexec/raven/raven
       install -Dm755 "$runtime/raven-runtime" $out/libexec/raven/raven-runtime
       install -Dm755 "$runtime/raven-bootstrap" $out/libexec/raven/raven-bootstrap
+      ${lib.optionalString withVst3 ''
+        install -Dm755 "$runtime/raven-vsthost.exe" $out/libexec/raven/raven-vsthost.exe
+        install -Dm755 "$runtime/raven-vst.so" $out/libexec/raven/raven-vst.so
+      ''}
 
       copy_component() {
         source_dir="$1"
@@ -325,6 +333,8 @@ let
     };
   };
 
+  raven-unwrapped = raven-unwrapped-for { };
+
   makeRaven =
     {
       extraPkgs ? (_: [ ]),
@@ -332,16 +342,22 @@ let
       extraProfile ? "",
       extraEnv ? { },
       extraBwrapArgs ? [ ],
+      withPrinters ? false,
+      withVst3 ? false,
       privateTmp ? true,
     }:
+    let
+      unwrapped = raven-unwrapped-for { inherit withVst3; };
+    in
     import ./fhs.nix { inherit lib pkgs; } {
+      raven-unwrapped = unwrapped;
       inherit
-        raven-unwrapped
         extraPkgs
         extraLibraries
         extraProfile
         extraEnv
         extraBwrapArgs
+        withPrinters
         privateTmp
         ;
       meta = {
@@ -357,7 +373,7 @@ let
       };
       passthru = {
         inherit components;
-        unwrapped = raven-unwrapped;
+        unwrapped = unwrapped;
       };
     };
 

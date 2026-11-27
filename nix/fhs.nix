@@ -10,6 +10,7 @@
   extraProfile ? "",
   extraEnv ? { },
   extraBwrapArgs ? [ ],
+  withPrinters ? false,
   privateTmp ? true,
   meta ? { },
   passthru ? { },
@@ -41,7 +42,8 @@ let
       openssl
       libpng
       liberation_ttf_v2
-    ];
+    ]
+    ++ lib.optionals withPrinters [ p.cups ];
 in
 pkgs.buildFHSEnv {
   pname = "raven";

@@ -83,9 +83,9 @@ let
   };
 
   dxvkArchive = fetchurl {
-    name = "dxvk-3.1.1.tar.gz";
-    url = "https://github.com/doitsujin/dxvk/releases/download/v3.1.1/dxvk-3.1.1.tar.gz";
-    hash = "sha256-QFZbSnJKrcRDP6TgELSyORbZsfG67uZOFxhtuU9U5gg=";
+    name = "dxvk-3.2.tar.gz";
+    url = "https://github.com/doitsujin/dxvk/releases/download/v3.2/dxvk-3.2.tar.gz";
+    sha256 = "17449ed21602377971289eb2984750699825ac1bac3bbfa2426b2bba0f355692";
   };
 
   wuffsSource = fetchurl {
@@ -98,6 +98,12 @@ let
     name = "libpng-1.6.59.tar.xz";
     url = "https://download.sourceforge.net/libpng/libpng-1.6.59.tar.xz";
     hash = "sha256-2A3So4o3+APLm2rHsUvW503cO2VHgKg4C9+TUj/bQ4k=";
+  };
+
+  vst3Archive = fetchurl {
+    name = "vst3-pluginterfaces-3.8.1_build_84-source.tar.gz";
+    url = "https://github.com/steinbergmedia/vst3_pluginterfaces/archive/refs/tags/v3.8.1_build_84.tar.gz";
+    sha256 = "19e88e225b6ecb4a3c429d3ff2fd511be9c6c8b8b1c7e86b05949b45c0553e2d";
   };
 
   npp = fetchurl {
@@ -421,7 +427,7 @@ CLSID_EOF
     test -f $out/fonts/RavenSans-Regular.ttf
   '';
 
-  dxvkTree = pkgs.runCommand "raven-dxvk-3.1.1" {
+  dxvkTree = pkgs.runCommand "raven-dxvk-3.2" {
     nativeBuildInputs = [
       pkgs.gnutar
       pkgs.gzip
@@ -429,6 +435,14 @@ CLSID_EOF
   } ''
     mkdir -p $out
     tar -xzf ${dxvkArchive} -C $out --strip-components=1
+  '';
+
+  vst3 = pkgs.runCommand "raven-vst3" {
+    nativeBuildInputs = [ pkgs.python3 ];
+  } ''
+    mkdir -p $out
+    cp ${vst3Archive} $out/vst3-pluginterfaces-3.8.1_build_84-source.tar.gz
+    python3 ${src}/scripts/provision-vst3.py --output $out
   '';
 in
 {
@@ -440,6 +454,7 @@ in
     roots
     sqlite
     fixtures
+    vst3
     ;
 
   installer64 = installer "x64";
