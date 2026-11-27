@@ -28,7 +28,14 @@
               mkdir -p "$(dirname "$log")"
               exec 3>"$log"
               status=0
-              raven --exit-code-fd 3 "$@" || status=$?
+              if [ "''${1:-}" = "--run-process" ] && [ "''${2:-}" = "--execution=native" ]; then
+                mode="$1"
+                execution="$2"
+                shift 2
+                raven "$mode" "$execution" --exit-code-fd=3 "$@" || status=$?
+              else
+                raven "$@" || status=$?
+              fi
               exec 3>&-
               guest="$(cat "$log" 2>/dev/null || true)"
               printf 'raven: host exit %s, guest exit %s\n' "$status" "''${guest:-unknown}" >&2
